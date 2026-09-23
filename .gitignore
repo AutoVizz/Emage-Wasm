@@ -9,3 +9,26 @@ cmake-build-*/
 
 # Node
 node_modules/
+
+# Vendored OpenJPEG is kept complete on disk but only the openjp2 parts the
+# WASM build needs are tracked. The rest (docs, CI, tests, tools, encoders,
+# Java binding, bundled third-party libz/png/tiff/lcms2/astyle) stays local,
+# untracked — verified unused by a fresh out-of-tree build.
+third_party/openjpeg/.github/
+third_party/openjpeg/scripts/
+third_party/openjpeg/doc/
+third_party/openjpeg/tests/
+third_party/openjpeg/tools/
+third_party/openjpeg/thirdparty/
+third_party/openjpeg/src/bin/
+third_party/openjpeg/wrapping/java/
+third_party/openjpeg/CTestConfig.cmake
+third_party/openjpeg/appveyor.yml
+third_party/openjpeg/.travis.yml
+third_party/openjpeg/AUTHORS.md
+third_party/openjpeg/CHANGELOG.md
+third_party/openjpeg/HOWTO-RELEASE
+third_party/openjpeg/INSTALL.md
+third_party/openjpeg/NEWS.md
+third_party/openjpeg/README.md
+third_party/openjpeg/THANKS.md
