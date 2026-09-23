@@ -1,0 +1,365 @@
+openapi: 3.1.0
+info:
+  title: Emage — JPEG 2000 layer-window server
+  description: |
+    Marker-only JPEG 2000 codestream server. Parses codestreams without decoding
+    (works on encrypted streams) and serves quality-layer windows for progressive
+    decoding, plus full-image upload with password auth.
+
+    Crypto-agnostic contract: the API never conveys whether an image is encrypted.
+    No header, query, or body field carries keys, IVs, or an encryption flag; the
+    server must not be extended to require or accept one. Encryption is entirely
+    in-band and self-describing on the client side: the codestream itself carries
+    its JPSEC SEC marker (0xFF 65), and only the client encrypts at encode time
+    and decrypts during decoding. The server treats that marker like any other
+    marker (the payload after SOD is opaque) and must never need to interpret it.
+
+    Layer-window protocol:
+      - `X-Emage-Layers: n:m`   → packets for layers n..m; header/framing included only when n == 0
+      - `X-Emage-Layers: n`     → single layer n (same framing rules)
+      - `X-Emage-Layers: all`   → headers + all packets, terminated with EOC (self-contained)
+      - `X-Emage-Layers: meta`  → JSON metadata (layers, size)
+
+    For windows that include headers, `X-Emage-LayerCountOffset` and
+    `X-Emage-TilePsotOffsets` tell the client where to patch the COD layer-count
+    and each tile-part's SOT Psot once it has assembled every layer.
+  version: 1.0.0
+servers:
+  - url: /
+paths:
+  /image/{path}:
+    get:
+      operationId: getImage
+      summary: Fetch a JPEG 2000 layer window.
+      description: |
+        Returns a codestream slice for the requested layer window. The slice is a
+        valid continuation stream for a progressive decoder; with `all` it is a
+        complete, standalone codestream.
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+          description: >-
+            Image-relative path under the configured image root (`Emage:ImageRoot`).
+            `..` and absolute paths are rejected. Empty value addresses the root.
+        - name: X-Emage-Layers
+          in: header
+          required: false
+          schema:
+            type: string
+            example: "0:1"
+          description: Layer window `n:m`, single layer `n`, `all`, or `meta`. Defaults to `all`.
+      responses:
+        "200":
+          description: >-
+            Layer-window slice as `image/jp2`. Includes main-headers only when the
+            window starts at layer 0.
+          headers:
+            X-Emage-Framing:
+              schema:
+                type: string
+                enum: ["headers+packets", "packets"]
+              description: headers+packets when the window starts at layer 0, else raw packets only.
+            X-Emage-Layers:
+              schema:
+                type: string
+              description: Requested window as served, `<n>:<m>`.
+            X-Emage-TotalLayers:
+              schema:
+                type: integer
+              description: Number of layers in the full codestream.
+            X-Emage-RemainingLayers:
+              schema:
+                type: integer
+              description: Layers still outstanding after `m` (`TotalLayers - m - 1`).
+            X-Emage-LayerCountOffset:
+              schema:
+                type: integer
+              description: >-
+                Byte offset of the COD layer-count field within the response body.
+                Present only when headers are included.
+            X-Emage-TilePsotOffsets:
+              schema:
+                type: string
+              description: >-
+                Comma-separated byte offsets of every tile-part's SOT Psot field
+                within the response body. Present only when headers are included.
+          content:
+            image/jp2:
+              schema:
+                type: string
+                format: binary
+        "200-meta":
+          $ref: "#/components/responses/Meta"
+        "400":
+          description: Invalid `X-Emage-Layers` value or unsupported codestream (e.g. POC, no PLT, non-LRCP mid-window).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      operationId: uploadImage
+      summary: Upload the full JPEG 2000 codestream.
+      description: |
+        Stores the uploaded bytes as `<path>` under the image root. Requires a
+        password matching `Emage:UploadPassword`; the endpoint is always
+        unauthorized when no password is configured. The uploaded body must be a
+        complete codestream ending with `0xFF 0xD9` (EOC) that parses cleanly —
+        layer slices are rejected. The file is immediately retrievable via GET
+        `/image/{path}`.
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Destination path under the image root.
+        - name: X-Emage-Password
+          in: header
+          required: true
+          schema:
+            type: string
+          description: Upload password (must equal `Emage:UploadPassword`).
+      requestBody:
+        required: true
+        content:
+          image/jp2:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          $ref: "#/components/responses/Uploaded"
+        "401":
+          description: Missing, empty, or wrong `X-Emage-Password`, or no password configured on the server.
+        "400":
+          description: Invalid path, empty body, missing EOC (not a full image), or unparseable codestream.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      operationId: deleteImage
+      summary: Delete an image.
+      description: |
+        Removes `<path>` from the image root and drops its cached index. Requires
+        a password matching `Emage:UploadPassword`; always unauthorized when no
+        password is configured.
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Image-relative path under the image root.
+        - name: X-Emage-Password
+          in: header
+          required: true
+          schema:
+            type: string
+          description: Upload password (must equal `Emage:UploadPassword`).
+      responses:
+        "200":
+          description: Image deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted:
+                    type: string
+        "401":
+          description: Missing, empty, or wrong `X-Emage-Password`, or no password configured on the server.
+        "400":
+          description: Invalid image path.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /image-info/{path}:
+    get:
+      operationId: getImageInfo
+      summary: Full codestream metadata.
+      description: Detailed marker-derived metadata for an image. Works even for PLT-less or otherwise non-sliceable streams.
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Image-relative path under the image root.
+      responses:
+        "200":
+          description: Metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImageInfoResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /images:
+    get:
+      operationId: listImages
+      summary: List files under the image root.
+      description: |
+        Lists every file stored under the image root, sorted by path, including
+        parsed metadata (layers, width, height) when the file parses as a JPEG
+        2000 codestream.
+      responses:
+        "200":
+          description: Array of stored files.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [path, bytes]
+                  properties:
+                    path:
+                      type: string
+                      description: Path relative to the image root.
+                    bytes:
+                      type: integer
+                      description: Stored file length in bytes.
+                    layers:
+                      type: integer
+                      description: Total layers (present when the file is a supported codestream).
+                    width:
+                      type: integer
+                    height:
+                      type: integer
+components:
+  responses:
+    Meta:
+      description: Metadata for the image.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/MetaResponse"
+    Uploaded:
+      description: Upload accepted and stored.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/UploadResponse"
+    NotFound:
+      description: No such image, or the file is not a supported JPEG 2000 codestream.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    ErrorResponse:
+      type: object
+      additionalProperties: true
+      description: Plain-text error message body (may be a JSON string or free text).
+    MetaResponse:
+      type: object
+      required: [layers, width, height, bytes]
+      properties:
+        layers:
+          type: integer
+          description: Total layers in the codestream.
+        width:
+          type: integer
+        height:
+          type: integer
+        bytes:
+          type: integer
+          description: Length of the stored file in bytes.
+    UploadResponse:
+      type: object
+      required: [stored, layers, width, height, bytes]
+      properties:
+        stored:
+          type: string
+          description: Path the codestream was stored at, relative to the image root.
+        layers:
+          type: integer
+        width:
+          type: integer
+        height:
+          type: integer
+        bytes:
+          type: integer
+    ImageInfoResponse:
+      type: object
+      required:
+        [width, height, components, tileSize, tiles, layers, resolutions,
+         progression, scod, sop, eph, pltDebug, packets, packetsPerLayer, bytes, packetsByLayer]
+      properties:
+        width:
+          type: integer
+        height:
+          type: integer
+        components:
+          type: array
+          items:
+            type: object
+            required: [precision, dx, dy]
+            properties:
+              precision:
+                type: integer
+                description: Bit precision.
+              dx:
+                type: integer
+                description: Horizontal subsampling.
+              dy:
+                type: integer
+                description: Vertical subsampling.
+        tileSize:
+          type: object
+          required: [width, height]
+          properties:
+            width:
+              type: integer
+            height:
+              type: integer
+        tiles:
+          type: integer
+          description: Number of distinct tiles.
+        layers:
+          type: integer
+        resolutions:
+          type: integer
+        progression:
+          type: string
+          enum: [Lrcp, Rlcp, Rpcl, Pcrl, Cprl]
+        scod:
+          type: integer
+          description: Raw Scod byte (coding style; bit 0x02 = tile-part COD present).
+        sop:
+          type: boolean
+          description: Whether SOP/EPH markers are present.
+        eph:
+          type: boolean
+        pltDebug:
+          type: boolean
+          description: Whether a PLT marker is present (required for layer slicing).
+        packets:
+          type: integer
+          description: Total packets across all tile parts.
+        packetsPerLayer:
+          type: integer
+        bytes:
+          type: integer
+          description: Stored file length in bytes.
+        packetsByLayer:
+          type: array
+          items:
+            type: object
+            required: [layer, size]
+            properties:
+              layer:
+                type: integer
+              size:
+                type: integer
+                description: Total bytes of that layer's packets.

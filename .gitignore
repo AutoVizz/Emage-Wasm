@@ -1,0 +1,11 @@
+# Build output
+cmake-build-debug/
+cmake-build-wasm/
+cmake-build-*/
+
+# IDE
+.idea/
+*.iml
+
+# Node
+node_modules/
