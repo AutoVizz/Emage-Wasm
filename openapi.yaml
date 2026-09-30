@@ -20,9 +20,17 @@ info:
       - `X-Emage-Layers: all`   → headers + all packets, terminated with EOC (self-contained)
       - `X-Emage-Layers: meta`  → JSON metadata (layers, size)
 
-    For windows that include headers, `X-Emage-LayerCountOffset` and
-    `X-Emage-TilePsotOffsets` tell the client where to patch the COD layer-count
-    and each tile-part's SOT Psot once it has assembled every layer.
+    A window's main headers are byte-identical to the stored codestream's, COD's
+    decomposition count included, because a DWT resolution's pixel geometry is
+    derived from SIZ together with that count: renumbering the retained levels
+    from 0 would decode a 0:0 window of a 512x512/6-level codestream as 512x512
+    instead of 16x16. Every tile-part's Psot is corrected for the shortened body,
+    and the offsets of those fields are reported in `X-Emage-TilePsotOffsets`.
+
+    A window with `n == 0` includes the headers and is terminated with EOC, so it
+    is a self-contained codestream: the levels it does not carry are absent, and
+    a decoder reads it by reducing `NumResolutions - 1 - m` halvings. A window
+    with `n > 0` carries packets only, for splicing after the `n == 0` window.
   version: 1.0.0
 servers:
   - url: /
@@ -74,12 +82,6 @@ paths:
               schema:
                 type: integer
               description: Layers still outstanding after `m` (`TotalLayers - m - 1`).
-            X-Emage-LayerCountOffset:
-              schema:
-                type: integer
-              description: >-
-                Byte offset of the COD layer-count field within the response body.
-                Present only when headers are included.
             X-Emage-TilePsotOffsets:
               schema:
                 type: string
@@ -231,7 +233,11 @@ paths:
                       description: Stored file length in bytes.
                     layers:
                       type: integer
-                      description: Total layers (present when the file is a supported codestream).
+                      description: |
+                        Number of DWT resolution levels in the codestream, i.e. the number of
+                        progressively addressable spatial levels. Level 0 is full resolution
+                        and each further level halves width and height. This project does not
+                        use JPEG 2000 quality layers, so this is the only progression axis.
                     width:
                       type: integer
                     height:
@@ -267,7 +273,11 @@ components:
       properties:
         layers:
           type: integer
-          description: Total layers in the codestream.
+          description: >-
+            Number of DWT decomposition levels, so the deepest legal reduced
+            decode is `layers - 1`. This project does not use JPEG 2000 quality
+            layers, so `layers` counts resolution levels and is the only
+            progression axis the server reports.
         width:
           type: integer
         height:
@@ -293,7 +303,7 @@ components:
     ImageInfoResponse:
       type: object
       required:
-        [width, height, components, tileSize, tiles, layers, resolutions,
+        [width, height, components, tileSize, tiles, layers,
          progression, scod, sop, eph, pltDebug, packets, packetsPerLayer, bytes, packetsByLayer]
       properties:
         width:
@@ -328,8 +338,7 @@ components:
           description: Number of distinct tiles.
         layers:
           type: integer
-        resolutions:
-          type: integer
+          description: DWT resolution level count (quality layers are unused).
         progression:
           type: string
           enum: [Lrcp, Rlcp, Rpcl, Pcrl, Cprl]

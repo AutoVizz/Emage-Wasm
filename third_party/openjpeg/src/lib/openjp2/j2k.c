@@ -1930,51 +1930,72 @@ static OPJ_BOOL opj_j2k_write_soc(opj_j2k_t *p_j2k,
 }
 
 #ifdef USE_JPSEC
+/* Zone-table geometry lives in jpsec_aes.h, which is built into the encoder
+ * and decoder targets alongside this library. */
+extern int jpsec_get_zone_count(void);
+#define JPSEC_W_ZONE_ENTRY_BYTES 10
+#define JPSEC_W_MAX_ZONES 64
+
 /**
  * Write a SEC marker (Main security marker, ISO/IEC 15444-8 / ITU-T T.807 5.5).
- * Writes marker code, Lsec, Form (0x02: registry-based) and T.sec.
+ *
+ * Registry-based protection, T.807 5.5. The segment carries one zone entry per
+ * DWT resolution level so each level can be encrypted under its own key:
+ *
+ *   FF 65 | Lsec | Form(1) | T.sec(2) | E(1) | L(1) | zone info (E * 10 bytes)
+ *   Lsec = 7 + 10*E, L = 2 + 10*E
+ *   each zone entry: index(2) | Z(4) | T(4)
+ *
+ * Z and T are emitted as zeros to keep the segment size fixed: the codestream
+ * layout is not known until encoding finishes, so both are patched post-encode
+ * by jpsec_patch_sec_zones(). The zone count comes from jpsec_get_zone_count(),
+ * which the binding sets before setup because this runs as a header procedure,
+ * ahead of any per-tile parameters.
  */
 static OPJ_BOOL opj_j2k_write_sec(opj_j2k_t *p_j2k,
                                   opj_stream_private_t *p_stream,
                                   opj_event_mgr_t * p_manager)
 {
-    /*
-     * Main-header SEC segment (registry-based protection, T.807 5.5):
-     *   FF 65 | Lsec | Form(1) | T.sec(2) | E(1) | L(1) | Z(2) | T(2)
-     *        | KeyLen(1) | Key(16) | IV(16)           = 46 bytes total
-     * Z (zone start offset) and T (zone size) describe the entropy-coded
-     * data protected by the encryption scheme; Z/T/Key/IV are patched
-     * post-encode once the codestream layout is known, so they are emitted
-     * here as zeros to keep the segment size fixed.
-     */
-    OPJ_BYTE l_data[46];
-    OPJ_BYTE * l_start = l_data;
+    OPJ_BYTE l_data[2 + 7 + JPSEC_W_ZONE_ENTRY_BYTES * JPSEC_W_MAX_ZONES];
+    OPJ_BYTE *l_start = l_data;
+    OPJ_UINT32 lsec, total, i;
+    int e = jpsec_get_zone_count();
 
     assert(p_j2k != 00);
     assert(p_stream != 00);
     assert(p_manager != 00);
 
+    if (e < 1) {
+        e = 1;
+    }
+    if (e > JPSEC_W_MAX_ZONES) {
+        e = JPSEC_W_MAX_ZONES;
+    }
+    lsec = (OPJ_UINT32)(7 + JPSEC_W_ZONE_ENTRY_BYTES * e);
+    total = (OPJ_UINT32)(2 + lsec);
+
     opj_write_bytes(l_start, J2K_MS_SEC, 2);
     l_start += 2;
 
-    opj_write_bytes(l_start, 44, 2); /* Lsec = 2 + body(42) */
+    opj_write_bytes(l_start, (OPJ_UINT16)lsec, 2);
     l_start += 2;
 
-    *l_start++ = 0x02;              /* Form: registry-based */
-    opj_write_bytes(l_start, 0x0002, 2); /* T.sec: dummy AES-CTR tool */
+    *l_start++ = 0x02;                                   /* Form */
+    opj_write_bytes(l_start, 0x0002, 2);                  /* T.sec */
     l_start += 2;
 
-    *l_start++ = 0x01;              /* E: one protected zone */
-    *l_start++ = 0x04;              /* L: length of zone info */
-    opj_write_bytes(l_start, 0x0000, 2); /* Z: patched post-encode */
-    l_start += 2;
-    opj_write_bytes(l_start, 0x0000, 2); /* T: patched post-encode */
-    l_start += 2;
+    *l_start++ = (OPJ_BYTE)e;                            /* E: protected zones */
+    *l_start++ = (OPJ_BYTE)(2 + JPSEC_W_ZONE_ENTRY_BYTES * e); /* L */
 
-    *l_start++ = 16;                /* KeyLen */
-    memset(l_start, 0, 32);         /* Key + IV: patched post-encode */
+    /* Zone table: index written now, Z/T patched post-encode. */
+    for (i = 0; i < (OPJ_UINT32)e; ++i) {
+        opj_write_bytes(l_start, (OPJ_UINT16)i, 2);
+        opj_write_bytes(l_start, 0, 2);                   /* Z */
+        opj_write_bytes(l_start, 0, 2);                   /* T */
+        l_start += 8;
+    }
 
-    if (opj_stream_write_data(p_stream, l_data, 46, p_manager) != 46) {
+    if (opj_stream_write_data(p_stream, l_data, total, p_manager) != total) {
         return OPJ_FALSE;
     }
 

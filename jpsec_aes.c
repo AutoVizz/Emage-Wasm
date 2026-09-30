@@ -53,7 +53,7 @@ int jpsec_derive_level_keys(const uint8_t key0[JPSEC_AES_KEY_BYTES],
                             uint8_t *out) {
     size_t i;
 
-    if (levels <= 0 || levels > JPSEC_MAX_LEVELS) {
+    if (levels <= 0 || levels > JPSEC_MAX_ZONES) {
         return 0;
     }
     memcpy(out, key0, JPSEC_AES_KEY_BYTES);
@@ -65,26 +65,6 @@ int jpsec_derive_level_keys(const uint8_t key0[JPSEC_AES_KEY_BYTES],
                            JPSEC_AES_KEY_BYTES);
     }
     return levels;
-}
-
-void jpsec_aes256_ctr_cascade(const uint8_t key0[JPSEC_AES_KEY_BYTES],
-                              const uint8_t iv[JPSEC_AES_IV_BYTES],
-                              int levels,
-                              uint8_t *data,
-                              size_t len) {
-    uint8_t chain[JPSEC_MAX_LEVELS * JPSEC_AES_KEY_BYTES];
-    size_t i;
-
-    if (levels <= 0) {
-        levels = 1;
-    }
-    if (levels > JPSEC_MAX_LEVELS) {
-        levels = JPSEC_MAX_LEVELS;
-    }
-    (void)jpsec_derive_level_keys(key0, levels, chain);
-    for (i = 0; i < (size_t)levels; ++i) {
-        jpsec_aes256_ctr_crypt(chain + i * JPSEC_AES_KEY_BYTES, iv, data, len);
-    }
 }
 
 int jpsec_aes256_kat_self_test(void) {
@@ -146,62 +126,117 @@ size_t jpsec_find_marker(const uint8_t *buf, size_t size,
     return size;
 }
 
-int jpsec_parse_sec(const uint8_t *buf, size_t size, size_t sec_off,
-                    uint32_t *zone_start, uint32_t *zone_size,
-                    uint16_t *levels) {
-    uint32_t lsec;
-    if (size == 0 || sec_off > size || size - sec_off < 19) {
+/* ---------------------------------------------------------------------- */
+/* SEC zone table                                                         */
+/* ---------------------------------------------------------------------- */
+
+/* Zone count reserved by the encoder for the next encoded codestream.  The
+ * marker is emitted as a header procedure, so the binding cannot reach the
+ * per-tile resolution count from inside OpenJPEG and publishes it here
+ * instead. */
+static int g_zone_count = 1;
+
+void jpsec_set_zone_count(int zones) {
+    if (zones < 1) {
+        zones = 1;
+    }
+    if (zones > JPSEC_MAX_ZONES) {
+        zones = JPSEC_MAX_ZONES;
+    }
+    g_zone_count = zones;
+}
+
+int jpsec_get_zone_count(void) {
+    return g_zone_count;
+}
+
+static uint32_t rd_be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
+}
+
+static void wr_be32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >>  8);
+    p[3] = (uint8_t)(v      );
+}
+
+int jpsec_parse_sec_zones(const uint8_t *buf, size_t size, size_t sec_off,
+                          uint32_t *starts, uint32_t *sizes, int max) {
+    uint32_t lsec, l;
+    int e, i;
+
+    if (buf == NULL || starts == NULL || sizes == NULL || max < 1) {
+        return 0;
+    }
+    if (size == 0 || sec_off > size || size - sec_off < 9) {
         return 0;
     }
     if (buf[sec_off] != 0xff || buf[sec_off + 1] != 0x65) {
         return 0;
     }
-    /* Lsec includes the 2-byte length field itself. */
+    /* Lsec counts the 2-byte length field itself, so the segment body after
+     * it is Lsec - 2 bytes and the whole segment spans Lsec + 2 from the
+     * marker code. */
     lsec = ((uint32_t)buf[sec_off + 2] << 8) | buf[sec_off + 3];
-    if (lsec < 19 || sec_off + 2 + lsec > size) {
+    if (lsec < 9 || sec_off + 2 + lsec > size) {
         return 0;
     }
-    if (buf[sec_off + 4] != 0x02 ||          /* registry-based form */
-        buf[sec_off + 5] != 0x00 || buf[sec_off + 6] != 0x02 ||
-        buf[sec_off + 7] != 0x01) {          /* AES-CTR tool, one zone */
+    if (buf[sec_off + JPSEC_SEC_FORM_OFFSET] != 0x02 ||   /* registry-based */
+        buf[sec_off + JPSEC_SEC_TSEC_OFFSET] != 0x00 ||
+        buf[sec_off + JPSEC_SEC_TSEC_OFFSET + 1] != 0x02) {
         return 0;
     }
-    if (zone_start) {
-        *zone_start = ((uint32_t)buf[sec_off + JPSEC_SEC_Z_OFFSET    ] << 24) |
-                      ((uint32_t)buf[sec_off + JPSEC_SEC_Z_OFFSET + 1] << 16) |
-                      ((uint32_t)buf[sec_off + JPSEC_SEC_Z_OFFSET + 2] <<  8) |
-                       (uint32_t)buf[sec_off + JPSEC_SEC_Z_OFFSET + 3];
+    e = buf[sec_off + JPSEC_SEC_E_OFFSET];
+    l = buf[sec_off + JPSEC_SEC_L_OFFSET];
+    if (e < 1 || e > JPSEC_MAX_ZONES || e > max) {
+        return 0;
     }
-    if (zone_size) {
-        *zone_size  = ((uint32_t)buf[sec_off + JPSEC_SEC_T_OFFSET    ] << 24) |
-                      ((uint32_t)buf[sec_off + JPSEC_SEC_T_OFFSET + 1] << 16) |
-                      ((uint32_t)buf[sec_off + JPSEC_SEC_T_OFFSET + 2] <<  8) |
-                       (uint32_t)buf[sec_off + JPSEC_SEC_T_OFFSET + 3];
+    /* L must account for exactly the zone entries we are about to read. */
+    if (l != 2u + (uint32_t)e * JPSEC_ZONE_ENTRY_BYTES) {
+        return 0;
     }
-    if (levels) {
-        *levels = (uint16_t)(((uint32_t)buf[sec_off + JPSEC_SEC_LEVELS_OFFSET    ] << 8) |
-                             (uint32_t)buf[sec_off + JPSEC_SEC_LEVELS_OFFSET + 1]);
+    /* Lsec spans the length field, Form, T.sec, E and L, then the zone info:
+     * 2 + 1 + 2 + 1 + 1 = 7 bytes of header, and L already contains the
+     * per-entry 2-byte index that is part of the 10-byte entry. */
+    if (lsec != 5u + l) {
+        return 0;
     }
-    return 1;
+    for (i = 0; i < e; ++i) {
+        const uint8_t *z = buf + sec_off + JPSEC_SEC_ZONE_OFFSET +
+                           (size_t)i * JPSEC_ZONE_ENTRY_BYTES;
+        starts[i] = rd_be32(z + 2);
+        sizes[i]  = rd_be32(z + 6);
+    }
+    return e;
 }
 
-void jpsec_patch_sec(uint8_t *buf, size_t size, size_t sec_off,
-                     uint32_t zone_start, uint32_t zone_size,
-                     uint16_t levels) {
-    if (size == 0 || sec_off > size || size - sec_off < 19) {
+void jpsec_patch_sec_zones(uint8_t *buf, size_t size, size_t sec_off,
+                           const uint32_t *starts, const uint32_t *sizes,
+                           int count) {
+    int i;
+
+    if (buf == NULL || starts == NULL || sizes == NULL) {
         return;
     }
-    /* Z — 4-byte big-endian */
-    buf[sec_off + JPSEC_SEC_Z_OFFSET    ] = (uint8_t)(zone_start >> 24);
-    buf[sec_off + JPSEC_SEC_Z_OFFSET + 1] = (uint8_t)(zone_start >> 16);
-    buf[sec_off + JPSEC_SEC_Z_OFFSET + 2] = (uint8_t)(zone_start >>  8);
-    buf[sec_off + JPSEC_SEC_Z_OFFSET + 3] = (uint8_t)(zone_start       );
-    /* T — 4-byte big-endian */
-    buf[sec_off + JPSEC_SEC_T_OFFSET    ] = (uint8_t)(zone_size >> 24);
-    buf[sec_off + JPSEC_SEC_T_OFFSET + 1] = (uint8_t)(zone_size >> 16);
-    buf[sec_off + JPSEC_SEC_T_OFFSET + 2] = (uint8_t)(zone_size >>  8);
-    buf[sec_off + JPSEC_SEC_T_OFFSET + 3] = (uint8_t)(zone_size       );
-    /* Levels — 2-byte big-endian */
-    buf[sec_off + JPSEC_SEC_LEVELS_OFFSET    ] = (uint8_t)(levels >> 8);
-    buf[sec_off + JPSEC_SEC_LEVELS_OFFSET + 1] = (uint8_t)(levels       );
+    if (count < 1 || count > JPSEC_MAX_ZONES) {
+        return;
+    }
+    /* Only rewrite a table we can actually see in the buffer. */
+    if (size == 0 || sec_off > size ||
+        size - sec_off < (size_t)9 + (size_t)count * JPSEC_ZONE_ENTRY_BYTES) {
+        return;
+    }
+    if (buf[sec_off + JPSEC_SEC_E_OFFSET] != (uint8_t)count) {
+        return;
+    }
+    for (i = 0; i < count; ++i) {
+        uint8_t *z = buf + sec_off + JPSEC_SEC_ZONE_OFFSET +
+                     (size_t)i * JPSEC_ZONE_ENTRY_BYTES;
+        z[0] = 0;
+        z[1] = (uint8_t)i;   /* zone index == resolution level */
+        wr_be32(z + 2, starts[i]);
+        wr_be32(z + 6, sizes[i]);
+    }
 }

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -43,122 +44,154 @@ OPJ_BOOL opj_mem_seek(OPJ_OFF_T p_nb_bytes, void* p_user_data) {
     return OPJ_TRUE;
 }
 
-// JPSEC (dummy AES-CTR scheme): locate the protected byte zone and decrypt it
-// in place with the caller-supplied key/counter block before handing the bytes
-// to OpenJPEG.
-struct JpscZone {
+// Granular progressive decryption.
+//
+// The SEC marker carries one zone entry per DWT resolution level, each holding
+// a payload-relative byte range. Levels are numbered coarse-first — level 0 is
+// the 1-pixel approximation, level E-1 the finest — which is the order
+// OpenJPEG consumes when reducing.
+//
+// `accessLevel` is the highest level the caller may read. The decoder derives
+// K0..K_accessLevel from the master key, decrypts exactly those zones, and
+// leaves the rest as ciphertext. When the caller holds fewer levels than the
+// file contains, the codestream is rebuilt to declare and carry only the
+// levels it can read, so OpenJPEG is never handed a packet it cannot parse.
+//
+// A stream without a SEC marker is plaintext and is left untouched.
+struct JpscSecurity {
     bool valid = false;
-    size_t start = 0;
-    size_t end = 0;
-    int levels = 1;  // cascade rounds, read from the SEC marker when present
+    size_t payloadStart = 0;              // first byte after SOD
+    std::vector<uint32_t> starts;         // payload-relative offsets
+    std::vector<uint32_t> sizes;
 };
 
-// Compute the byte zone [start, end) that must be AES-CTR decrypted before
-// handing the buffer to OpenJPEG.
-//
-// Strategy (in priority order):
-//
-//  1. Use the Z/T fields stored in the SEC marker — the encoder patches these
-//     with the exact byte offsets after compression, so they are authoritative
-//     for complete codestreams.  We validate that the declared range fits inside
-//     the buffer before trusting it.
-//
-//  2. For progressive slices the buffer is only a prefix of the full file, so
-//     the stored Z/T (which point into the full-file layout) will exceed the
-//     buffer size and fail the range check.  In that case we fall back to
-//     scanning the HEADER (plaintext) for the SOD marker and use the end of the
-//     buffer as the zone end.  We deliberately do NOT scan the encrypted payload
-//     for EOC — encrypted data can contain 0xFF 0xD9 at arbitrary positions
-//     (false positives), which would cause us to decrypt a shorter zone than the
-//     encoder encrypted and corrupt the codestream.
-//
-//  A stream without a SEC marker is plaintext and is left untouched.
-JpscZone computeSecurityZone(const uint8_t* bytes, size_t size) {
-    JpscZone zone;
-    if (size == 0) return zone;
-
-    const size_t soc = jpsec_find_marker(bytes, size, 0xFF, 0x4F, 0);
-    if (soc == size || soc + 2 >= size) return zone;
-
-    // Main header is SOC .. SOD, and only the payload after SOD is ever
-    // encrypted.  Only a *structurally valid* SEC segment inside the header
-    // counts as a security marker: a coincidental FF 65 pair inside the
-    // (possibly encrypted) packet data must not be mistaken for one.  This
-    // keeps plaintext codestreams whose payload happens to contain FF 65
-    // ("poly" unencrypted flows) free of spurious decryption.
-    //
-    // Structural validation and field extraction are delegated to
-    // jpsec_parse_sec() (layout documented in jpsec_aes.h): registry-based
-    // form + T.sec=0x0002 + E=1, with Z/T/Levels read as big-endian fields at
-    // segment offsets 9..16 / 17..18.  Level defaults to 1 for streams whose
-    // marker predates the Levels field.
-    const size_t sod = jpsec_find_marker(bytes, size, 0xFF, 0x93, soc + 2);
-    const size_t headerEnd = (sod == size) ? size : sod + 2;
-
-    size_t sec = size;
-    uint32_t secStart = 0;
-    uint32_t secSize  = 0;
-    int levels = 1;
-    for (size_t i = soc + 2; i + 1 < headerEnd;) {
-        const size_t m = jpsec_find_marker(bytes, size, 0xFF, 0x65, i);
-        if (m == size || m >= headerEnd - 1) break;  // nothing (else) in the header
-        uint32_t z = 0;
-        uint32_t t = 0;
-        uint16_t l = 0;
-        if (jpsec_parse_sec(bytes, size, m, &z, &t, &l)) {
-            sec = m;
-            secStart = z;
-            secSize = t;
-            if (l >= 1 && l <= JPSEC_MAX_LEVELS) levels = l;
-            break;
-        }
-        i = m + 2;  // scan past a look-alike FF 65 pair
-    }
-    if (sec == size) return zone;  // plaintext stream, nothing to decrypt
-    zone.levels = levels;
-
-    // --- Priority 1: SEC marker's stored Z/T (authoritative for full streams) ---
-    if (secStart  != 0 && secSize != 0 &&
-        static_cast<size_t>(secStart) <  size &&
-        static_cast<size_t>(secSize)  <= size - static_cast<size_t>(secStart)) {
-        zone.valid = true;
-        zone.start = static_cast<size_t>(secStart);
-        zone.end   = static_cast<size_t>(secStart) + static_cast<size_t>(secSize);
-        return zone;
-    }
-
-    // --- Priority 2: scan-based fallback for progressive slices ---
-    // The header (SOC .. SOD) is always plaintext, so scanning for SOD here is
-    // safe.  We do NOT scan past SOD into the (possibly encrypted) payload.
-    if (sod != size && sod + 2 < size) {
-        const size_t zoneStart = sod + 2;
-        // Use end-of-buffer as zone end.  For assembled progressive streams
-        // finalizeStream() appends 0xFF 0xD9 (EOC); check for it so we don't
-        // include the EOC itself in the decryption range.
-        size_t zoneEnd = size;
-        if (size >= 2 &&
-            bytes[size - 2] == 0xFF && bytes[size - 1] == 0xD9) {
-            zoneEnd = size - 2;
-        }
-        if (zoneEnd > zoneStart) {
-            zone.valid = true;
-            zone.start = zoneStart;
-            zone.end   = zoneEnd;
-        }
-    }
-    return zone;
+size_t findInHeader(const uint8_t* bytes, size_t size, size_t from, size_t limit,
+                    uint8_t hi, uint8_t lo) {
+    const size_t m = jpsec_find_marker(bytes, size, hi, lo, from);
+    return (m < limit) ? m : size;
 }
 
-void decryptJpscZone(uint8_t* bytes,
-                     const uint8_t key[JPSEC_AES_KEY_BYTES],
-                     const uint8_t iv[JPSEC_AES_IV_BYTES],
-                     int levels,
-                     const JpscZone& zone) {
-    if (!zone.valid) return;
-    // levels <= 0 means "as stored in the SEC marker". For header-less
-    // windows (no marker) the caller must supply the explicit count.
-    if (levels <= 0) levels = zone.levels;
-    jpsec_aes256_ctr_cascade(key, iv, levels, bytes + zone.start, zone.end - zone.start);
+// A zone table is believable when its offsets never move backwards and the
+// first zone lies inside the payload we hold. Trailing zones are allowed to
+// overrun: a stream truncated to fewer levels keeps the full table.
+bool sec_ok_starts(const uint32_t* starts, const uint32_t* sizes, int n,
+                   size_t payload) {
+    uint32_t prevEnd = 0;
+    for (int z = 0; z < n; ++z) {
+        if (starts[z] < prevEnd) {
+            return false;
+        }
+        prevEnd = starts[z] + sizes[z];
+    }
+    return (size_t)starts[0] <= payload;
+}
+
+JpscSecurity computeSecurityZones(const uint8_t* bytes, size_t size) {
+    JpscSecurity sec;
+    if (size == 0) return sec;
+
+    const size_t soc = jpsec_find_marker(bytes, size, 0xFF, 0x4F, 0);
+    if (soc == size || soc + 2 >= size) return sec;
+    // The main header is SOC..SOD and is always plaintext, so it is the only
+    // region scanned for a security marker. Scanning into the payload would let
+    // a coincidental FF 65 pair in packet data trigger spurious decryption.
+    const size_t sod = jpsec_find_marker(bytes, size, 0xFF, 0x93, soc + 2);
+    const size_t headerEnd = (sod == size) ? size : sod + 2;
+    if (sod == size || sod + 2 >= size) return sec;
+
+    uint32_t starts[JPSEC_MAX_ZONES];
+    uint32_t sizes[JPSEC_MAX_ZONES];
+    for (size_t i = soc + 2; i + 1 < headerEnd;) {
+        const size_t m = jpsec_find_marker(bytes, size, 0xFF, 0x65, i);
+        if (m == size || m >= headerEnd - 1) break;
+        const int n = jpsec_parse_sec_zones(bytes, size, m, starts, sizes,
+                                            JPSEC_MAX_ZONES);
+        if (n > 0) {
+            // Zones must be ordered and start inside the payload. Zones beyond
+            // the bytes we hold are tolerated: a stream previously truncated to
+            // fewer levels still carries the full zone table, and OpenJPEG
+            // ignores SEC entirely, so the header stays meaningful.
+            const size_t payload = size - (sod + 2);
+            bool ok = sec_ok_starts(starts, sizes, n, payload);
+            if (ok) {
+                sec.valid = true;
+                sec.payloadStart = sod + 2;
+                sec.starts.assign(starts, starts + n);
+                sec.sizes.assign(sizes, sizes + n);
+            }
+            break;
+        }
+        i = m + 2;  // step past a look-alike FF 65 pair
+    }
+    return sec;
+}
+
+// Decrypt levels 0..accessLevel and return the number of payload bytes those
+// levels occupy. accessLevel is clamped to the levels actually present; a
+// negative value means "every level in the file".
+size_t decryptAccessibleLevels(uint8_t* bytes,
+                               const uint8_t key[JPSEC_AES_KEY_BYTES],
+                               const uint8_t iv[JPSEC_AES_IV_BYTES],
+                               int accessLevel,
+                               const JpscSecurity& sec) {
+    if (!sec.valid) return 0;
+    const int count = static_cast<int>(sec.sizes.size());
+    if (accessLevel < 0 || accessLevel >= count) accessLevel = count - 1;
+
+    uint8_t chain[JPSEC_MAX_ZONES * JPSEC_AES_KEY_BYTES];
+    if (jpsec_derive_level_keys(key, accessLevel + 1, chain) != accessLevel + 1) {
+        throw std::runtime_error("failed to derive granular key chain");
+    }
+    size_t keep = 0;
+    for (int r = 0; r <= accessLevel; ++r) {
+        const size_t start = sec.payloadStart + sec.starts[(size_t)r];
+        const size_t len = sec.sizes[(size_t)r];
+        if (len > 0) {
+            jpsec_aes256_ctr_crypt(chain + (size_t)r * JPSEC_AES_KEY_BYTES, iv,
+                                   bytes + start, len);
+        }
+        keep = sec.starts[(size_t)r] + len;
+    }
+    return keep;
+}
+
+// Cut the codestream down to the payload prefix covered by the levels the
+// caller may read, leaving every header segment intact.
+//
+// The headers are kept verbatim on purpose: rewriting COD's decomposition
+// count would make OpenJPEG reinterpret the surviving subbands at the wrong
+// scale, and dropping PLT would need a tile-part rebuild with a corrected
+// Psot. Truncating the payload alone is enough, because the decode resolution
+// factor tells OpenJPEG to stop after the last level it can read. Only Psot is
+// corrected, since it otherwise still advertises the full tile-part length.
+std::vector<uint8_t> truncateToLevels(const std::vector<uint8_t>& bytes,
+                                      const JpscSecurity& sec,
+                                      size_t keepBytes) {
+    const size_t sod = sec.payloadStart - 2;
+    const size_t sot = findInHeader(bytes.data(), bytes.size(), 0, sod, 0xFF, 0x90);
+    if (sot == bytes.size() || sot + 10 > bytes.size()) {
+        throw std::runtime_error("cannot truncate codestream: no SOT");
+    }
+    // SOT is 12 fixed bytes: marker(2) Lsot(2) Isot(2) Psot(4) TPsot(1) TNsot(1).
+    std::vector<uint8_t> out;
+    out.reserve(sot + 12 + keepBytes + 2);
+    out.insert(out.end(), bytes.begin(), bytes.begin() + (sec.payloadStart + keepBytes));
+
+    // Psot = total tile-part length, or 0 when it runs to the end of the file.
+    const uint32_t psot = (static_cast<uint32_t>(bytes[sot + 6]) << 24) |
+                          (static_cast<uint32_t>(bytes[sot + 7]) << 16) |
+                          (static_cast<uint32_t>(bytes[sot + 8]) <<  8) |
+                           static_cast<uint32_t>(bytes[sot + 9]);
+    if (psot != 0) {
+        const uint32_t newPsot = static_cast<uint32_t>(sec.payloadStart + keepBytes - sot);
+        out[sot + 6] = static_cast<uint8_t>(newPsot >> 24);
+        out[sot + 7] = static_cast<uint8_t>(newPsot >> 16);
+        out[sot + 8] = static_cast<uint8_t>(newPsot >>  8);
+        out[sot + 9] = static_cast<uint8_t>(newPsot);
+    }
+    out.push_back(0xFF);
+    out.push_back(0xD9);                                  // EOC
+    return out;
 }
 }  // namespace
 
@@ -166,15 +199,34 @@ struct DecodeResult {
     int width = 0;
     int height = 0;
     int numComponents = 0;
+    // DWT halvings actually applied (0 = full resolution), and the codestream's
+    // resolution count, so a caller can pick a finer or coarser level without
+    // re-deriving the decomposition count from the pixel dimensions.
+    int reduction = 0;
+    int numResolutions = 0;
     val rgbaPixels = val::null();
 };
 
-DecodeResult decodeInternal(uintptr_t j2kBufferPtr, size_t bufferSize,
+// Read the codestream's resolution count from the already-parsed main header.
+// opj_image_t does not carry it, so it is read back out of the tile-component
+// coding parameters. Returns 0 when it cannot be determined.
+int readNumResolutions(opj_codec_t* codec) {
+    opj_codestream_info_v2_t* info = opj_get_cstr_info(codec);
+    if (!info) return 0;
+    int count = 0;
+    if (info->m_default_tile_info.tccp_info) {
+        count = static_cast<int>(info->m_default_tile_info.tccp_info[0].numresolutions);
+    }
+    opj_destroy_cstr_info(&info);
+    return count;
+}
+
+DecodeResult decodeInternal(const uint8_t* input, size_t inputSize,
                             const uint8_t key[JPSEC_AES_KEY_BYTES],
                             const uint8_t iv[JPSEC_AES_IV_BYTES],
-                            int levels,
-                            const JpscZone& zone) {
-    if (!j2kBufferPtr || bufferSize == 0) {
+                            int accessLevel,
+                            int reduction) {
+    if (!input || inputSize == 0) {
         throw std::runtime_error("Invalid input buffer");
     }
 
@@ -183,9 +235,40 @@ DecodeResult decodeInternal(uintptr_t j2kBufferPtr, size_t bufferSize,
         throw std::runtime_error("AES-256-CTR / SHA3-256 KAT self-test failed");
     }
 
-    uint8_t* j2kBytes = reinterpret_cast<uint8_t*>(j2kBufferPtr);
+    const JpscSecurity sec = computeSecurityZones(input, inputSize);
 
-    decryptJpscZone(j2kBytes, key, iv, levels, zone);
+    // Levels the caller may read are decrypted in place; anything finer is
+    // left as ciphertext. When the caller holds a subset, the codestream is
+    // rebuilt around just those levels so OpenJPEG never meets a packet it
+    // cannot parse.
+    std::vector<uint8_t> owned;
+    const uint8_t* j2kBytes = input;
+    size_t bufferSize = inputSize;
+    if (sec.valid) {
+        const size_t keep = decryptAccessibleLevels(
+            const_cast<uint8_t*>(input), key, iv, accessLevel, sec);
+        const int total = static_cast<int>(sec.sizes.size());
+        const int granted =
+            (accessLevel < 0 || accessLevel >= total) ? total - 1 : accessLevel;
+        // Levels are counted coarse-first, so the finest image this key set can
+        // reconstruct is the one at resolution level `granted`:
+        //     reduction >= total - 1 - granted
+        // A finer request is clamped rather than honoured. OpenJPEG does not
+        // fail on a truncated payload — it synthesises the missing levels as
+        // empty and returns a plausible-looking but wrong image, so silently
+        // over-reading would be far worse than a coarser result. The clamped
+        // value is reported back in DecodeResult::reduction.
+        const int minReduction = total - 1 - granted;
+        if (reduction < minReduction) {
+            reduction = minReduction;
+        }
+        if (granted < total - 1) {
+            owned = truncateToLevels(
+                std::vector<uint8_t>(input, input + inputSize), sec, keep);
+            j2kBytes = owned.data();
+            bufferSize = owned.size();
+        }
+    }
 
     MemoryReader reader{j2kBytes, bufferSize, 0};
     opj_stream_t* stream = opj_stream_create(OPJ_J2K_STREAM_CHUNK_SIZE, OPJ_TRUE);
@@ -213,6 +296,25 @@ DecodeResult decodeInternal(uintptr_t j2kBufferPtr, size_t bufferSize,
         throw std::runtime_error("Failed to read J2K header");
     }
 
+    // Reduced-resolution decode. opj_set_decoded_resolution_factor() takes a
+    // reduction factor — the number of DWT halvings — and decodes only the
+    // resolution level that many halvings above the coarsest, so the code blocks
+    // and coefficient arrays of the finer levels are never allocated or MQ
+    // decoded. It rejects a factor that is not below the codestream's resolution
+    // count, so clamp against the count the header declares rather than failing.
+    // Must be called after opj_read_header() and before opj_decode().
+    int appliedReduction = 0;
+    const int numResolutions = readNumResolutions(codec);
+    if (reduction > 0 && numResolutions > 1) {
+        OPJ_UINT32 resFactor = static_cast<OPJ_UINT32>(reduction);
+        if (resFactor >= static_cast<OPJ_UINT32>(numResolutions)) {
+            resFactor = static_cast<OPJ_UINT32>(numResolutions) - 1;
+        }
+        if (opj_set_decoded_resolution_factor(codec, resFactor)) {
+            appliedReduction = static_cast<int>(resFactor);
+        }
+    }
+
     if (!opj_decode(codec, stream, image)) {
         opj_image_destroy(image);
         opj_stream_destroy(stream);
@@ -223,24 +325,46 @@ DecodeResult decodeInternal(uintptr_t j2kBufferPtr, size_t bufferSize,
     opj_stream_destroy(stream);
     opj_destroy_codec(codec);
 
-    const int width = image->x1 - image->x0;
-    const int height = image->y1 - image->y0;
+    // Convert OpenJPEG planar data into a contiguous RGBA buffer ready for Canvas.
+    // Components are allowed to have different sizes (4:2:0 and friends), so each
+    // one is indexed with its own stride and resampled to the component-0 grid.
+    // Sharing a single index across components would read past the end of every
+    // subsampled plane.
+    const int width = static_cast<int>(image->comps[0].w);
+    const int height = static_cast<int>(image->comps[0].h);
     const int numComps = image->numcomps;
     const size_t totalPixels = static_cast<size_t>(width) * height;
-
-    // Convert OpenJPEG planar data into a contiguous RGBA buffer ready for Canvas
     std::vector<uint8_t> rgba(totalPixels * 4, 255);
 
-    for (size_t i = 0; i < totalPixels; ++i) {
-        if (numComps >= 3) { // RGB
-            rgba[i * 4 + 0] = static_cast<uint8_t>(image->comps[0].data[i]);
-            rgba[i * 4 + 1] = static_cast<uint8_t>(image->comps[1].data[i]);
-            rgba[i * 4 + 2] = static_cast<uint8_t>(image->comps[2].data[i]);
-        } else if (numComps == 1) { // Grayscale
-            uint8_t val = static_cast<uint8_t>(image->comps[0].data[i]);
-            rgba[i * 4 + 0] = val;
-            rgba[i * 4 + 1] = val;
-            rgba[i * 4 + 2] = val;
+    // Nearest-neighbour fetch of one component at an (x, y) position on the
+    // component-0 grid.
+    auto sample = [&image, numComps, width, height](int c, int x, int y) -> uint8_t {
+        if (c >= numComps) return 0;
+        const opj_image_comp_t& comp = image->comps[c];
+        if (!comp.data || comp.w == 0 || comp.h == 0) return 0;
+        int sx = x, sy = y;
+        if (comp.w != width) sx = static_cast<int>(static_cast<int64_t>(x) * comp.w / width);
+        if (comp.h != height) sy = static_cast<int>(static_cast<int64_t>(y) * comp.h / height);
+        if (sx < 0) sx = 0;
+        if (sy < 0) sy = 0;
+        if (sx >= static_cast<int>(comp.w)) sx = static_cast<int>(comp.w) - 1;
+        if (sy >= static_cast<int>(comp.h)) sy = static_cast<int>(comp.h) - 1;
+        return static_cast<uint8_t>(comp.data[static_cast<size_t>(sy) * comp.w + sx]);
+    };
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const size_t i = static_cast<size_t>(y) * width + x;
+            if (numComps >= 3) { // RGB / YCbCr
+                rgba[i * 4 + 0] = sample(0, x, y);
+                rgba[i * 4 + 1] = sample(1, x, y);
+                rgba[i * 4 + 2] = sample(2, x, y);
+            } else if (numComps == 1) { // Grayscale
+                const uint8_t val = sample(0, x, y);
+                rgba[i * 4 + 0] = val;
+                rgba[i * 4 + 1] = val;
+                rgba[i * 4 + 2] = val;
+            }
         }
     }
 
@@ -250,35 +374,40 @@ DecodeResult decodeInternal(uintptr_t j2kBufferPtr, size_t bufferSize,
     val jsRgba = val::global("Uint8ClampedArray").new_(rgba.size());
     jsRgba.call<void>("set", val(typed_memory_view(rgba.size(), rgba.data())));
 
-    return DecodeResult{width, height, numComps, jsRgba};
+    return DecodeResult{width, height, numComps, appliedReduction, numResolutions, jsRgba};
 }
 
-// Decrypt with a caller-supplied AES-256 cascade key0 and counter block. The
+// Decrypt with a caller-supplied AES-256 master key and counter block. The
 // key/IV are accepted as JS arrays (or typed arrays) and coerced here.
 //
 // Polymorphic: cryptographic and unencrypted flows share this entry point.
 // For unencrypted streams (no SEC marker in the main header) the key/IV are
-// optional and ignored — pass null/undefined, levels too. Only codestreams
-// that actually carry a SEC marker demand a key and an IV, and a clear error
-// is raised then.
+// optional and ignored — pass null/undefined. Only codestreams that actually
+// carry a SEC marker demand a key and an IV, and a clear error is raised then.
 //
-// `levels` is the cascade depth. Pass 0 (or <= 0) to read it from the SEC
-// marker (works for full images and assembled layer-window streams, whose
-// headers carry the marker). Header-less layer windows have no marker, so an
-// explicit positive count is required there. Encrypted decode is only reached
-// once the key is verified to be exactly 32 bytes and the IV exactly 16.
+// `accessLevel` is the highest DWT resolution level the caller may decrypt,
+// counted coarse-first: 0 is the 1-pixel approximation. K0..K_accessLevel are
+// derived from the master key, exactly the levels OpenJPEG needs to rebuild a
+// reduced image, and finer levels stay encrypted and are dropped from the
+// codestream handed to it. Pass a negative value to decrypt every level the
+// file contains.
+//
+// `reduction` is the number of DWT halvings to decode at: 0 is the full
+// resolution, 1 is half linear scale, and so on. It is clamped to the
+// codestream's own resolution count, and the clamped value is reported back in
+// DecodeResult::reduction alongside DecodeResult::numResolutions.
 DecodeResult decodeRaw(uintptr_t j2kBufferPtr,
                        size_t bufferSize,
                        emscripten::val key,
                        emscripten::val iv,
-                       int levels) {
+                       int accessLevel,
+                       int reduction) {
     if (!j2kBufferPtr || bufferSize == 0) {
         throw std::runtime_error("Invalid input buffer");
     }
 
-    const JpscZone zone =
-        computeSecurityZone(reinterpret_cast<const uint8_t*>(j2kBufferPtr),
-                            bufferSize);
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(j2kBufferPtr);
+    const JpscSecurity sec = computeSecurityZones(bytes, bufferSize);
 
     const bool hasKey = !key.isUndefined() && !key.isNull();
     const bool hasIv  = !iv.isUndefined() && !iv.isNull();
@@ -291,7 +420,7 @@ DecodeResult decodeRaw(uintptr_t j2kBufferPtr,
         if (kb.size() != JPSEC_AES_KEY_BYTES) {
             throw std::runtime_error("key must be exactly 32 bytes");
         }
-    } else if (zone.valid) {
+    } else if (sec.valid) {
         throw std::runtime_error(
             "key is required: the codestream is encrypted (SEC marker present)");
     }
@@ -301,39 +430,40 @@ DecodeResult decodeRaw(uintptr_t j2kBufferPtr,
         if (ib.size() != JPSEC_AES_IV_BYTES) {
             throw std::runtime_error("iv must be exactly 16 bytes");
         }
-    } else if (zone.valid) {
+    } else if (sec.valid) {
         throw std::runtime_error(
             "iv is required: the codestream is encrypted (SEC marker present)");
     }
 
-    if (zone.valid && levels > JPSEC_MAX_LEVELS) {
-        throw std::runtime_error("levels too high");
-    }
-
-    return decodeInternal(j2kBufferPtr, bufferSize, kb.data(), ib.data(), levels, zone);
+    return decodeInternal(bytes, bufferSize, kb.data(), ib.data(), accessLevel,
+                          reduction);
 }
 
-// Report the security zone the decoder would decrypt for a given buffer.  The
-// progressive website uses this to show which byte range is still ciphertext at
-// each assembled layer stage; it reads exactly the same zone computeSecurityZone()
-// derives, without modifying the buffer.
+// Report the per-level protection the decoder sees in a given buffer, without
+// modifying it. The progressive UI uses this to show which resolution levels
+// are already readable at each assembled stage and which are still ciphertext.
+// Offsets are relative to the first payload byte, matching the SEC marker.
 struct SecurityZone {
     int hasSec = 0;
-    size_t zoneStart = 0;
-    size_t zoneSize = 0;
-    int levels = 1;
+    int zoneCount = 0;
+    val starts = val::null();
+    val sizes = val::null();
 };
 
 SecurityZone describeSecurityZone(uintptr_t j2kBufferPtr, size_t bufferSize) {
     SecurityZone out;
     if (bufferSize == 0) return out;
-    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(j2kBufferPtr);
-    const JpscZone zone = computeSecurityZone(bytes, bufferSize);
-    if (zone.valid) {
-        out.hasSec = 1;
-        out.zoneStart = zone.start;
-        out.zoneSize = zone.end - zone.start;
-        out.levels = zone.levels;
+    const JpscSecurity sec = computeSecurityZones(
+        reinterpret_cast<const uint8_t*>(j2kBufferPtr), bufferSize);
+    if (!sec.valid) return out;
+
+    out.hasSec = 1;
+    out.zoneCount = static_cast<int>(sec.sizes.size());
+    out.starts = val::array();
+    out.sizes = val::array();
+    for (size_t i = 0; i < sec.sizes.size(); ++i) {
+        out.starts.call<void>("push", sec.starts[i]);
+        out.sizes.call<void>("push", sec.sizes[i]);
     }
     return out;
 }
@@ -343,13 +473,15 @@ EMSCRIPTEN_BINDINGS(j2k_decoder) {
         .field("width", &DecodeResult::width)
         .field("height", &DecodeResult::height)
         .field("numComponents", &DecodeResult::numComponents)
+        .field("reduction", &DecodeResult::reduction)
+        .field("numResolutions", &DecodeResult::numResolutions)
         .field("rgbaPixels", &DecodeResult::rgbaPixels);
 
     value_object<SecurityZone>("SecurityZone")
         .field("hasSec", &SecurityZone::hasSec)
-        .field("zoneStart", &SecurityZone::zoneStart)
-        .field("zoneSize", &SecurityZone::zoneSize)
-        .field("levels", &SecurityZone::levels);
+        .field("zoneCount", &SecurityZone::zoneCount)
+        .field("starts", &SecurityZone::starts)
+        .field("sizes", &SecurityZone::sizes);
 
     function("decodeRaw", &decodeRaw);
     function("describeSecurityZone", &describeSecurityZone);

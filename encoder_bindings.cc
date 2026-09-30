@@ -20,42 +20,149 @@ constexpr int kModeSegsym = 0x20;
 constexpr int kCstySop = 0x02;
 constexpr int kCstyEph = 0x04;
 
-// Encryption over the entropy-coded payload: the SEC marker (FF 65) emitted by
-// the encoder when SEC=YES is set describes a single protected zone (Z = start
-// offset, T = size in bytes). After encoding, the zone is encrypted in place as
-// an AES-256-CTR cascade of `levels` rounds: every round uses the exact same
-// caller-supplied IV, and the round keys form a hash chain K1 = SHA3-256(K0),
-// K2 = SHA3-256(K1), ... derived from the caller-supplied 256-bit key0. Z/T and
-// the level count are patched into the marker; key material never travels with
-// the file — the decoder must be given the same key0 (+ optionally levels).
-void applyAesCtrSecurity(std::vector<uint8_t>& data,
-                         const uint8_t key[JPSEC_AES_KEY_BYTES],
-                         const uint8_t iv[JPSEC_AES_IV_BYTES],
-                         int levels) {
+// Granular progressive encryption.
+//
+// The packet payload is split into one protected zone per DWT resolution
+// level, taken from the tile-part packet table (PLT), and each zone is
+// encrypted exactly once under its own key from the SHA3-256 chain over the
+// caller's master key: K0 = key, K1 = SHA3(K0), K2 = SHA3(K1), ...
+//
+// Because OpenJPEG rebuilds a reduced image from the coarse levels only,
+// a holder of K0..Kr can decode at reduction r and never touches the levels
+// above it. The SEC marker records one zone entry per level so the decoder
+// does not have to re-derive the boundaries; offsets are relative to the
+// first payload byte, which keeps them valid when the serving layer rebuilds
+// the main header. No key material is written to the file.
+namespace {
+
+// PLT packet lengths are JPEG variable-length integers: 7 bits per byte,
+// big-endian, high bit set on every byte except the last.
+uint32_t readPacketLength(const uint8_t*& p) {
+    uint32_t v = 0;
+    for (int i = 0; i < 5; ++i) {
+        const uint8_t b = *p++;
+        v = (v << 7) | (b & 0x7fu);
+        if (!(b & 0x80u)) {
+            return v;
+        }
+    }
+    return v;
+}
+
+// Read the packet length table between the SOT and SOD markers and fold it
+// into per-resolution byte ranges relative to `payloadStart`.
+//
+// Layout note: this encoder always emits one tile, one quality layer and no
+// precinct partition, so under the default LRCP order each resolution level
+// contributes exactly numComponents consecutive packets.
+void computeLevelRanges(const std::vector<uint8_t>& data,
+                        size_t pltOff,
+                        size_t sotOff,
+                        size_t payloadStart,
+                        int numResolutions,
+                        int numComponents,
+                        std::vector<uint32_t>& starts,
+                        std::vector<uint32_t>& sizes) {
+    if (pltOff == data.size()) {
+        throw std::runtime_error("granular keys require a PLT packet table");
+    }
+    if (sotOff >= pltOff) {
+        throw std::runtime_error("malformed tile-part header");
+    }
+    const size_t lplt = ((size_t)data[pltOff + 2] << 8) | data[pltOff + 3];
+    if (lplt < 3 || pltOff + 2 + lplt > data.size()) {
+        throw std::runtime_error("malformed PLT length");
+    }
+    // Body after the 2-byte length field: Zplt then the packet lengths.
+    const size_t wanted = (size_t)numResolutions * (size_t)numComponents;
+    std::vector<uint32_t> lengths;
+    lengths.reserve(wanted);
+
+    // Zplt occupies the first body byte; the packet lengths follow.
+    const uint8_t* p = data.data() + pltOff + 5;
+    const uint8_t* end = data.data() + pltOff + 2 + lplt;
+    while (p < end && lengths.size() < wanted) {
+        const uint8_t* q = p;
+        lengths.push_back(readPacketLength(q));
+        p = q;
+    }
+    if (lengths.size() != wanted) {
+        throw std::runtime_error("PLT packet count does not match "
+                                 "numResolutions * numComponents");
+    }
+
+    size_t offset = 0;
+    starts.assign((size_t)numResolutions, 0);
+    sizes.assign((size_t)numResolutions, 0);
+    for (int r = 0; r < numResolutions; ++r) {
+        size_t bytes = 0;
+        for (int c = 0; c < numComponents; ++c) {
+            bytes += lengths[(size_t)r * (size_t)numComponents + (size_t)c];
+        }
+        starts[(size_t)r] = (uint32_t)offset;
+        sizes[(size_t)r] = (uint32_t)bytes;
+        offset += bytes;
+    }
+    if (payloadStart + offset > data.size()) {
+        throw std::runtime_error("packet table overruns the codestream");
+    }
+}
+
+void applyGranularSecurity(std::vector<uint8_t>& data,
+                           const uint8_t key[JPSEC_AES_KEY_BYTES],
+                           const uint8_t iv[JPSEC_AES_IV_BYTES],
+                           int numResolutions,
+                           int numComponents) {
     const size_t soc =
         jpsec_find_marker(data.data(), data.size(), 0xFF, 0x4F, 0);
     if (soc == data.size()) return;
     const size_t sec =
         jpsec_find_marker(data.data(), data.size(), 0xFF, 0x65, soc + 2);
     if (sec == data.size()) return;
+    const size_t sot =
+        jpsec_find_marker(data.data(), data.size(), 0xFF, 0x90, sec + 2);
+    if (sot == data.size()) return;
+    const size_t plt =
+        jpsec_find_marker(data.data(), data.size(), 0xFF, 0x58, sot + 2);
+    if (plt == data.size()) return;
     const size_t sod =
-        jpsec_find_marker(data.data(), data.size(), 0xFF, 0x93, sec + 2);
+        jpsec_find_marker(data.data(), data.size(), 0xFF, 0x93, plt + 2);
     if (sod == data.size()) return;
-    const size_t eoc =
-        jpsec_find_marker(data.data(), data.size(), 0xFF, 0xD9, sod + 2);
-    if (eoc == data.size()) return;
 
-    const size_t zoneStart = sod + 2;
-    const size_t zoneSize = eoc - zoneStart;
-    if (zoneSize == 0) return;
+    const size_t payloadStart = sod + 2;
 
-    if (levels <= 0) levels = 1;
-    jpsec_aes256_ctr_cascade(key, iv, levels, data.data() + zoneStart, zoneSize);
-    jpsec_patch_sec(data.data(), data.size(), sec,
-                    static_cast<uint32_t>(zoneStart),
-                    static_cast<uint32_t>(zoneSize),
-                    static_cast<uint16_t>(levels));
+    std::vector<uint32_t> starts;
+    std::vector<uint32_t> sizes;
+    computeLevelRanges(data, plt, sot, payloadStart, numResolutions,
+                       numComponents, starts, sizes);
+
+    size_t total = 0;
+    for (uint32_t s : sizes) {
+        total += s;
+    }
+    // The packet table gives an exact payload extent, so EOC is located
+    // arithmetically rather than by scanning for FF D9, which can false
+    // positive on arbitrary packet bytes.
+    const size_t eoc = payloadStart + total;
+    if (eoc + 2 > data.size() || data[eoc] != 0xff || data[eoc + 1] != 0xd9) {
+        throw std::runtime_error("EOC does not follow the packet table");
+    }
+
+    uint8_t chain[JPSEC_MAX_ZONES * JPSEC_AES_KEY_BYTES];
+    if (jpsec_derive_level_keys(key, numResolutions, chain) != numResolutions) {
+        throw std::runtime_error("failed to derive granular key chain");
+    }
+    for (int r = 0; r < numResolutions; ++r) {
+        if (sizes[(size_t)r] == 0) continue;
+        jpsec_aes256_ctr_crypt(chain + (size_t)r * JPSEC_AES_KEY_BYTES, iv,
+                               data.data() + payloadStart + starts[(size_t)r],
+                               sizes[(size_t)r]);
+    }
+    jpsec_patch_sec_zones(data.data(), data.size(), sec,
+                          starts.data(), sizes.data(), numResolutions);
 }
+
+}  // namespace
 
 void ojp_error_callback(const char* msg, void* /*client_data*/) {
     fprintf(stderr, "[openjpeg error] %s", msg);
@@ -80,9 +187,7 @@ struct EncodeOptions {
     bool enableSop = false;
     bool enableEph = false;
     bool enableTlm = false;
-    bool enablePlt = false;
     bool enableSec = false;
-    int levels = 1;  // AES-256-CTR cascade rounds; keys chained via SHA3-256
     // Optional 32-byte AES-256 key and 16-byte IV. Omitted when no encryption
     // is requested. The marker never stores these values.
     emscripten::val key = emscripten::val::undefined();
@@ -122,13 +227,16 @@ std::vector<uint8_t> encodeInternal(const uint8_t* pixels,
     if (opts.width <= 0 || opts.height <= 0) {
         throw std::runtime_error("width/height must be positive");
     }
-    if (opts.levels < 1 || opts.levels > JPSEC_MAX_LEVELS) {
-        throw std::runtime_error("levels must be between 1 and 64");
-    }
     // OpenJPEG sizes tcp_rates/tcp_distoratio as fixed [100] arrays, so the
     // layer count is bounded by the codec struct rather than any library policy.
     if (opts.numLayers < 1 || opts.numLayers > 100) {
         throw std::runtime_error("numLayers must be between 1 and 100");
+    }
+    // One protected zone per resolution level, so the SEC marker's zone table is
+    // only sized correctly while the resolution count fits the table.
+    if (opts.numResolutions < 1 || opts.numResolutions > JPSEC_MAX_ZONES) {
+        throw std::runtime_error(
+            "numResolutions must be between 1 and " + std::to_string(JPSEC_MAX_ZONES));
     }
     const size_t expectedBytes = static_cast<size_t>(opts.width) * opts.height *
                                  opts.numComponents;
@@ -177,16 +285,20 @@ std::vector<uint8_t> encodeInternal(const uint8_t* pixels,
 
     parameters.irreversible = opts.lossless ? 0 : 1;
     parameters.numresolution = opts.numResolutions;
-    parameters.tcp_numlayers = opts.numLayers;
+    // Progression: always one lossless quality layer.
+    // numResolutions determines the number of DWT levels and therefore
+    // how many resolution steps the client can progressively decode.
+    parameters.tcp_numlayers = 1;
+    parameters.tcp_rates[0] = 0.0f;  // 0 = lossless
     parameters.cp_fixed_quality = 0;
     parameters.cp_disto_alloc = 1;
-
-    for (int i = 0; i < opts.numLayers; ++i) {
-        parameters.tcp_rates[i] =
-            (i == opts.numLayers - 1) ? 0.0f
-                                       : static_cast<float>(opts.numLayers - i) * 4.0f;
-    }
-    parameters.prog_order = OPJ_LRCP;
+    // prog_order is deliberately left at the OpenJPEG default (OPJ_LRCP).
+    // With tcp_numlayers = 1 the layer index is constant, so sorting by
+    // (layer, resolution, ...) and by (resolution, layer, ...) yield the same
+    // packet order: LRCP and RLCP emit identical codestreams here. Nothing in
+    // this project uses quality layers, so declaring RLCP bought nothing and
+    // only invited RLCP-specific branches elsewhere. If quality layers are ever
+    // added, this must become OPJ_RLCP so a byte prefix stays resolution-major.
 
     parameters.mode = 0;
     if (opts.enablePterm)  parameters.mode |= kModePterm;
@@ -211,13 +323,13 @@ std::vector<uint8_t> encodeInternal(const uint8_t* pixels,
         throw std::runtime_error("opj_setup_encoder failed");
     }
 
-    // Emit TLM (main header) and PLT (tile-part header) marker segments so the
-    // headers carry the lengths of the tile-parts and packets respectively.
-    // SEC adds a JPSEC security marker to the main header.
-    const char* extraOptions[3] = {nullptr, nullptr, nullptr};
+    // PLT is emitted unconditionally: the packet table is what lets the
+    // encoder split the payload into per-resolution protected zones. TLM is
+    // still opt-in. SEC adds a JPSEC security marker to the main header.
+    const char* extraOptions[4] = {nullptr, nullptr, nullptr, nullptr};
     int extraOptionCount = 0;
     if (opts.enableTlm) extraOptions[extraOptionCount++] = "TLM=YES";
-    if (opts.enablePlt) extraOptions[extraOptionCount++] = "PLT=YES";
+    extraOptions[extraOptionCount++] = "PLT=YES";
     if (opts.enableSec) extraOptions[extraOptionCount++] = "SEC=YES";
     if (extraOptionCount > 0 &&
         !opj_encoder_set_extra_options(codec, extraOptions)) {
@@ -225,6 +337,10 @@ std::vector<uint8_t> encodeInternal(const uint8_t* pixels,
         opj_image_destroy(image);
         throw std::runtime_error("opj_encoder_set_extra_options failed");
     }
+
+    // The SEC segment is written as a header procedure, before any per-tile
+    // parameters exist, so the number of zone entries is published up front.
+    jpsec_set_zone_count(opts.numResolutions);
 
     const char* outPath = "/tmp/encode_out.j2k";
     opj_stream_t* stream = opj_stream_create_default_file_stream(outPath, OPJ_FALSE);
@@ -259,7 +375,8 @@ std::vector<uint8_t> encodeInternal(const uint8_t* pixels,
     remove(outPath);
 
     if (opts.enableSec) {
-        applyAesCtrSecurity(result, key, iv, opts.levels);
+        applyGranularSecurity(result, key, iv, opts.numResolutions,
+                              opts.numComponents);
     }
 
     return result;
@@ -278,6 +395,37 @@ emscripten::val encodeRaw(uintptr_t pixelPtr,
     return jsArray;
 }
 
+// Expose the granular key chain so a client can display or distribute the
+// per-resolution keys after upload. Returns one lowercase hex string per key,
+// K0 first, each 32 bytes. The chain is derived locally from the master key;
+// nothing here is sent anywhere.
+val deriveGranularKeys(emscripten::val key, int count) {
+    if (count < 1 || count > JPSEC_MAX_ZONES) {
+        throw std::runtime_error("count must be between 1 and 64");
+    }
+    std::vector<uint8_t> master = convertJSArrayToNumberVector<uint8_t>(key);
+    if (master.size() != JPSEC_AES_KEY_BYTES) {
+        throw std::runtime_error("key must be exactly 32 bytes");
+    }
+    uint8_t chain[JPSEC_MAX_ZONES * JPSEC_AES_KEY_BYTES];
+    if (jpsec_derive_level_keys(master.data(), count, chain) != count) {
+        throw std::runtime_error("failed to derive granular key chain");
+    }
+    static const char* kHex = "0123456789abcdef";
+    val out = val::array();
+    for (int i = 0; i < count; ++i) {
+        std::string hex;
+        hex.reserve(JPSEC_AES_KEY_BYTES * 2);
+        for (size_t b = 0; b < JPSEC_AES_KEY_BYTES; ++b) {
+            const uint8_t v = chain[(size_t)i * JPSEC_AES_KEY_BYTES + b];
+            hex.push_back(kHex[v >> 4]);
+            hex.push_back(kHex[v & 0x0f]);
+        }
+        out.call<void>("push", std::string(hex));
+    }
+    return out;
+}
+
 EMSCRIPTEN_BINDINGS(j2k_jpsec_encoder) {
     value_object<EncodeOptions>("EncodeOptions")
         .field("width", &EncodeOptions::width)
@@ -292,11 +440,10 @@ EMSCRIPTEN_BINDINGS(j2k_jpsec_encoder) {
         .field("enableSop", &EncodeOptions::enableSop)
         .field("enableEph", &EncodeOptions::enableEph)
         .field("enableTlm", &EncodeOptions::enableTlm)
-        .field("enablePlt", &EncodeOptions::enablePlt)
         .field("enableSec", &EncodeOptions::enableSec)
-        .field("levels", &EncodeOptions::levels)
         .field("key", &EncodeOptions::key)
         .field("iv", &EncodeOptions::iv);
 
     function("encodeRaw", &encodeRaw);
+    function("deriveGranularKeys", &deriveGranularKeys);
 }
