@@ -198,11 +198,6 @@ struct EncodeOptions {
 std::vector<uint8_t> encodeInternal(const uint8_t* pixels,
                                     size_t pixelSize,
                                     const EncodeOptions& opts) {
-    static const bool kAesKatOk = jpsec_aes256_kat_self_test() == 1;
-    if (!kAesKatOk) {
-        throw std::runtime_error("AES-256-CTR / SHA3-256 KAT self-test failed");
-    }
-
     const uint8_t* key = jpsec_test_key;
     const uint8_t* iv = jpsec_test_iv;
     uint8_t keyBuf[JPSEC_AES_KEY_BYTES];

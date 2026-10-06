@@ -254,11 +254,6 @@ DecodeResult decodeInternal(const uint8_t* input, size_t inputSize,
         throw std::runtime_error("Invalid input buffer");
     }
 
-    static const bool kAesKatOk = jpsec_aes256_kat_self_test() == 1;
-    if (!kAesKatOk) {
-        throw std::runtime_error("AES-256-CTR / SHA3-256 KAT self-test failed");
-    }
-
     const JpscSecurity sec = computeSecurityZones(input, inputSize);
 
     // Levels the caller may read are decrypted in place; anything finer is

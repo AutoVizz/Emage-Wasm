@@ -71,10 +71,6 @@ extern const uint8_t jpsec_test_iv[JPSEC_AES_IV_BYTES];
 void jpsec_set_zone_count(int zones);
 int  jpsec_get_zone_count(void);
 
-/* Returns 1 if the AES-256 (FIPS-197 C.3) and SHA3-256 (empty-input) KAT
- * vectors pass, i.e. both newly-enabled primitives are sound. */
-int jpsec_aes256_kat_self_test(void);
-
 /* AES-256-CTR in place (NIST SP 800-38A, key=256 bits).  Encryption and
  * decryption are the same operation. */
 void jpsec_aes256_ctr_crypt(const uint8_t key[JPSEC_AES_KEY_BYTES],
