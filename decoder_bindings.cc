@@ -74,16 +74,21 @@ size_t findInHeader(const uint8_t* bytes, size_t size, size_t from, size_t limit
 // A zone table is believable when its offsets never move backwards and the
 // first zone lies inside the payload we hold. Trailing zones are allowed to
 // overrun: a stream truncated to fewer levels keeps the full table.
+//
+// Arithmetic is done in 64 bits because starts[z] and sizes[z] are 32-bit
+// attacker-controlled fields; summing them as uint32_t could wrap and defeat
+// the monotonicity check below.
 bool sec_ok_starts(const uint32_t* starts, const uint32_t* sizes, int n,
                    size_t payload) {
-    uint32_t prevEnd = 0;
+    uint64_t prevEnd = 0;
     for (int z = 0; z < n; ++z) {
-        if (starts[z] < prevEnd) {
+        const uint64_t start = starts[z];
+        if (start < prevEnd) {
             return false;
         }
-        prevEnd = starts[z] + sizes[z];
+        prevEnd = start + static_cast<uint64_t>(sizes[z]);
     }
-    return (size_t)starts[0] <= payload;
+    return static_cast<uint64_t>(starts[0]) <= static_cast<uint64_t>(payload);
 }
 
 JpscSecurity computeSecurityZones(const uint8_t* bytes, size_t size) {
@@ -129,12 +134,19 @@ JpscSecurity computeSecurityZones(const uint8_t* bytes, size_t size) {
 // Decrypt levels 0..accessLevel and return the number of payload bytes those
 // levels occupy. accessLevel is clamped to the levels actually present; a
 // negative value means "every level in the file".
-size_t decryptAccessibleLevels(uint8_t* bytes,
+//
+// `size` is the total buffer length. Every zone range is clamped to the bytes
+// actually present before it is used for a read or a write, because Z and T
+// come straight out of an untrusted codestream: without the clamp a hostile SEC
+// marker can declare a T far larger than the payload and turn the in-place
+// decrypt into an out-of-bounds heap write.
+size_t decryptAccessibleLevels(uint8_t* bytes, size_t size,
                                const uint8_t key[JPSEC_AES_KEY_BYTES],
                                const uint8_t iv[JPSEC_AES_IV_BYTES],
                                int accessLevel,
                                const JpscSecurity& sec) {
-    if (!sec.valid) return 0;
+    if (!sec.valid || size <= sec.payloadStart) return 0;
+    const size_t payload = size - sec.payloadStart;
     const int count = static_cast<int>(sec.sizes.size());
     if (accessLevel < 0 || accessLevel >= count) accessLevel = count - 1;
 
@@ -144,15 +156,22 @@ size_t decryptAccessibleLevels(uint8_t* bytes,
     }
     size_t keep = 0;
     for (int r = 0; r <= accessLevel; ++r) {
-        const size_t start = sec.payloadStart + sec.starts[(size_t)r];
-        const size_t len = sec.sizes[(size_t)r];
+        const size_t start = sec.starts[(size_t)r];
+        // A zone that begins past the payload, or that declares more bytes than
+        // remain, is treated as empty rather than trusted.
+        const size_t len = (start >= payload)
+            ? 0
+            : std::min(static_cast<size_t>(sec.sizes[(size_t)r]), payload - start);
         if (len > 0) {
             jpsec_aes256_ctr_crypt(chain + (size_t)r * JPSEC_AES_KEY_BYTES, iv,
-                                   bytes + start, len);
+                                   bytes + sec.payloadStart + start, len);
         }
-        keep = sec.starts[(size_t)r] + len;
+        if (start + len > keep) {
+            keep = start + len;
+        }
     }
-    return keep;
+    // Never report more retained bytes than the buffer holds.
+    return keep > payload ? payload : keep;
 }
 
 // Cut the codestream down to the payload prefix covered by the levels the
@@ -168,6 +187,11 @@ std::vector<uint8_t> truncateToLevels(const std::vector<uint8_t>& bytes,
                                       const JpscSecurity& sec,
                                       size_t keepBytes) {
     const size_t sod = sec.payloadStart - 2;
+    // keepBytes derives from the codestream's own SEC table, so it is clamped to
+    // the bytes we actually hold before it becomes an iterator range.
+    if (keepBytes > bytes.size() - sec.payloadStart) {
+        keepBytes = bytes.size() - sec.payloadStart;
+    }
     const size_t sot = findInHeader(bytes.data(), bytes.size(), 0, sod, 0xFF, 0x90);
     if (sot == bytes.size() || sot + 10 > bytes.size()) {
         throw std::runtime_error("cannot truncate codestream: no SOT");
@@ -246,7 +270,7 @@ DecodeResult decodeInternal(const uint8_t* input, size_t inputSize,
     size_t bufferSize = inputSize;
     if (sec.valid) {
         const size_t keep = decryptAccessibleLevels(
-            const_cast<uint8_t*>(input), key, iv, accessLevel, sec);
+            const_cast<uint8_t*>(input), inputSize, key, iv, accessLevel, sec);
         const int total = static_cast<int>(sec.sizes.size());
         const int granted =
             (accessLevel < 0 || accessLevel >= total) ? total - 1 : accessLevel;
