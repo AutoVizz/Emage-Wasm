@@ -521,10 +521,11 @@ DecodeResult decodeRaw(uintptr_t j2kBufferPtr,
         if (ib.size() != JPSEC_AES_IV_BYTES) {
             throw std::runtime_error("iv must be exactly 16 bytes");
         }
-    } else if (sec.valid) {
-        throw std::runtime_error(
-            "iv is required: the codestream is encrypted (SEC marker present)");
     }
+    // No IV is required from the caller: the counter block travels in the SEC
+    // marker and decodeInternal prefers it. A supplied IV is length-checked
+    // above but then superseded, so a reader needs nothing but the key and the
+    // codestream.
 
     return decodeInternal(bytes, bufferSize, kb.data(), ib.data(), accessLevel,
                           reduction);
