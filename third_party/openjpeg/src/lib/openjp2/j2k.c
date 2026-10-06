@@ -1933,33 +1933,46 @@ static OPJ_BOOL opj_j2k_write_soc(opj_j2k_t *p_j2k,
 /* Zone-table geometry lives in jpsec_aes.h, which is built into the encoder
  * and decoder targets alongside this library. */
 extern int jpsec_get_zone_count(void);
+extern const unsigned char *jpsec_get_iv(void);
 #define JPSEC_W_ZONE_ENTRY_BYTES 10
-#define JPSEC_W_MAX_ZONES 64
+#define JPSEC_W_MAC_ENTRY_BYTES  32
+#define JPSEC_W_ENTRY_TOTAL     (JPSEC_W_ZONE_ENTRY_BYTES + JPSEC_W_MAC_ENTRY_BYTES)
+#define JPSEC_W_PID_FIXED       18       /* E(2) + IV(16) */
+#define JPSEC_W_MAX_ZONES       64
+#define JPSEC_W_TOOL_ID         0x80000002u
+#define JPSEC_W_PSEC_FPSEC      0x0080u
 
 /**
  * Write a SEC marker (Main security marker, ISO/IEC 15444-8 / ITU-T T.807 5.5).
  *
- * Registry-based protection, T.807 5.5. The segment carries one zone entry per
- * DWT resolution level so each level can be encrypted under its own key:
+ * The segment is a single tool block whose ID sits in the user-defined range
+ * 0x80000000..0xEFFFFFFF, so no JPSEC Registration Authority entry is needed:
  *
- *   FF 65 | Lsec | Form(1) | T.sec(2) | E(1) | L(1) | zone info (E * 10 bytes)
- *   Lsec = 7 + 10*E, L = 2 + 10*E
- *   each zone entry: index(2) | Z(4) | T(4)
+ *   FF 65 | Lsec | Zsec(2) | Psec(2) | ID(4) | LZOI(2) | LPID(2) | PID
  *
- * Z and T are emitted as zeros to keep the segment size fixed: the codestream
- * layout is not known until encoding finishes, so both are patched post-encode
- * by jpsec_patch_sec_zones(). The zone count comes from jpsec_get_zone_count(),
- * which the binding sets before setup because this runs as a header procedure,
- * ahead of any per-tile parameters.
+ * Lsec counts itself and everything after it, so the segment spans 2 + Lsec
+ * bytes from the marker code. LZOI is 0: the standard Zone of Influence is
+ * skipped and granularity is carried by our own table inside the opaque PID.
+ * Psec sets FPSEC and Ntools=1.
+ *
+ * The PID is ours: E(2) | IV(16) | E zone entries of 10 bytes | E MACs of 32.
+ * Z, T and the MACs are emitted as zeros because the codestream layout is not
+ * known until encoding finishes; they are patched post-encode by
+ * jpsec_patch_sec_zones() and jpsec_patch_sec_macs(). The zone count and IV
+ * come from jpsec_get_zone_count()/jpsec_get_iv(), which the binding sets
+ * before setup because this runs as a header procedure, ahead of any
+ * per-tile parameters.
  */
 static OPJ_BOOL opj_j2k_write_sec(opj_j2k_t *p_j2k,
                                   opj_stream_private_t *p_stream,
                                   opj_event_mgr_t * p_manager)
 {
-    OPJ_BYTE l_data[2 + 7 + JPSEC_W_ZONE_ENTRY_BYTES * JPSEC_W_MAX_ZONES];
+    OPJ_BYTE l_data[16 + JPSEC_W_PID_FIXED +
+                    JPSEC_W_ENTRY_TOTAL * JPSEC_W_MAX_ZONES];
     OPJ_BYTE *l_start = l_data;
-    OPJ_UINT32 lsec, total, i;
+    OPJ_UINT32 lpid, lsec, total;
     int e = jpsec_get_zone_count();
+    const unsigned char *iv;
 
     assert(p_j2k != 00);
     assert(p_stream != 00);
@@ -1971,8 +1984,16 @@ static OPJ_BOOL opj_j2k_write_sec(opj_j2k_t *p_j2k,
     if (e > JPSEC_W_MAX_ZONES) {
         e = JPSEC_W_MAX_ZONES;
     }
-    lsec = (OPJ_UINT32)(7 + JPSEC_W_ZONE_ENTRY_BYTES * e);
+
+    /* Zeroed in full: every byte of both tables is patched after the encode, but
+     * the buffer must not carry indeterminate stack content into the
+     * codestream even transiently. */
+    memset(l_data, 0, sizeof(l_data));
+
+    lpid = (OPJ_UINT32)(JPSEC_W_PID_FIXED + JPSEC_W_ENTRY_TOTAL * e);
+    lsec = (OPJ_UINT32)(14 + lpid);
     total = (OPJ_UINT32)(2 + lsec);
+    iv = jpsec_get_iv();
 
     opj_write_bytes(l_start, J2K_MS_SEC, 2);
     l_start += 2;
@@ -1980,20 +2001,30 @@ static OPJ_BOOL opj_j2k_write_sec(opj_j2k_t *p_j2k,
     opj_write_bytes(l_start, (OPJ_UINT16)lsec, 2);
     l_start += 2;
 
-    *l_start++ = 0x02;                                   /* Form */
-    opj_write_bytes(l_start, 0x0002, 2);                  /* T.sec */
+    opj_write_bytes(l_start, 0, 2);                        /* Zsec: first marker */
     l_start += 2;
 
-    *l_start++ = (OPJ_BYTE)e;                            /* E: protected zones */
-    *l_start++ = (OPJ_BYTE)(2 + JPSEC_W_ZONE_ENTRY_BYTES * e); /* L */
+    opj_write_bytes(l_start,
+                    (OPJ_UINT16)(JPSEC_W_PSEC_FPSEC | 1u), 2); /* Psec: FPSEC|1 */
+    l_start += 2;
 
-    /* Zone table: index written now, Z/T patched post-encode. */
-    for (i = 0; i < (OPJ_UINT32)e; ++i) {
-        opj_write_bytes(l_start, (OPJ_UINT16)i, 2);
-        opj_write_bytes(l_start, 0, 2);                   /* Z */
-        opj_write_bytes(l_start, 0, 2);                   /* T */
-        l_start += 8;
-    }
+    opj_write_bytes(l_start, (OPJ_UINT32)JPSEC_W_TOOL_ID, 4);
+    l_start += 4;
+
+    opj_write_bytes(l_start, 0, 2);                        /* LZOI: no ZOI */
+    l_start += 2;
+
+    opj_write_bytes(l_start, (OPJ_UINT16)lpid, 2);          /* LPID */
+    l_start += 2;
+
+    opj_write_bytes(l_start, (OPJ_UINT16)e, 2);            /* PID: E */
+    l_start += 2;
+
+    memcpy(l_start, iv, 16);                               /* PID: IV */
+    l_start += 16;
+
+    /* Zone table at PID+18 and the MAC table after it, both left zeroed. */
+    l_start += (size_t)JPSEC_W_ENTRY_TOTAL * (size_t)e;
 
     if (opj_stream_write_data(p_stream, l_data, total, p_manager) != total) {
         return OPJ_FALSE;

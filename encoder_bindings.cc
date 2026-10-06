@@ -148,10 +148,28 @@ void applyGranularSecurity(std::vector<uint8_t>& data,
         throw std::runtime_error("EOC does not follow the packet table");
     }
 
+    // The cumulative MAC chain is computed over the plaintext, before any of it
+    // is encrypted, and covers Z and T as well so the tag also pins each zone's
+    // position and extent.  Both are payload-relative, which is why the tags
+    // stay valid when the serving layer rebuilds the main header.
     uint8_t chain[JPSEC_MAX_ZONES * JPSEC_AES_KEY_BYTES];
     if (jpsec_derive_level_keys(key, numResolutions, chain) != numResolutions) {
         throw std::runtime_error("failed to derive granular key chain");
     }
+    std::vector<uint8_t> macs((size_t)numResolutions * JPSEC_MAC_ENTRY_BYTES);
+    for (int r = 0; r < numResolutions; ++r) {
+        const uint8_t *prev = r == 0 ? nullptr
+                                     : &macs[(size_t)(r - 1) * JPSEC_MAC_ENTRY_BYTES];
+        const uint8_t *plain = data.data() + payloadStart + starts[(size_t)r];
+        if (!jpsec_level_mac(prev, chain + (size_t)r * JPSEC_AES_KEY_BYTES,
+                             (uint32_t)r, starts[(size_t)r], sizes[(size_t)r],
+                             plain, sizes[(size_t)r],
+                             &macs[(size_t)r * JPSEC_MAC_ENTRY_BYTES])) {
+            throw std::runtime_error("failed to compute level MAC");
+        }
+    }
+
+    // Encrypt after the tags are taken: the payload is plaintext only here.
     for (int r = 0; r < numResolutions; ++r) {
         if (sizes[(size_t)r] == 0) continue;
         jpsec_aes256_ctr_crypt(chain + (size_t)r * JPSEC_AES_KEY_BYTES, iv,
@@ -160,6 +178,8 @@ void applyGranularSecurity(std::vector<uint8_t>& data,
     }
     jpsec_patch_sec_zones(data.data(), data.size(), sec,
                           starts.data(), sizes.data(), numResolutions);
+    jpsec_patch_sec_macs(data.data(), data.size(), sec,
+                         macs.data(), numResolutions);
 }
 
 }  // namespace
@@ -334,8 +354,10 @@ std::vector<uint8_t> encodeInternal(const uint8_t* pixels,
     }
 
     // The SEC segment is written as a header procedure, before any per-tile
-    // parameters exist, so the number of zone entries is published up front.
+    // parameters exist, so the zone count and the counter block are published
+    // up front.
     jpsec_set_zone_count(opts.numResolutions);
+    jpsec_set_iv(opts.enableSec ? iv : jpsec_test_iv);
 
     const char* outPath = "/tmp/encode_out.j2k";
     opj_stream_t* stream = opj_stream_create_default_file_stream(outPath, OPJ_FALSE);

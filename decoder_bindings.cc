@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "jpsec_aes.h"
@@ -63,6 +64,8 @@ struct JpscSecurity {
     size_t payloadStart = 0;              // first byte after SOD
     std::vector<uint32_t> starts;         // payload-relative offsets
     std::vector<uint32_t> sizes;
+    uint8_t iv[JPSEC_AES_IV_BYTES] = {}; // counter block, carried in the marker
+    std::vector<uint8_t> macs;            // cumulative SHA3-256 tag per level
 };
 
 size_t findInHeader(const uint8_t* bytes, size_t size, size_t from, size_t limit,
@@ -106,11 +109,13 @@ JpscSecurity computeSecurityZones(const uint8_t* bytes, size_t size) {
 
     uint32_t starts[JPSEC_MAX_ZONES];
     uint32_t sizes[JPSEC_MAX_ZONES];
+    uint8_t iv[JPSEC_AES_IV_BYTES];
+    uint8_t macs[JPSEC_MAX_ZONES * JPSEC_MAC_ENTRY_BYTES];
     for (size_t i = soc + 2; i + 1 < headerEnd;) {
         const size_t m = jpsec_find_marker(bytes, size, 0xFF, 0x65, i);
         if (m == size || m >= headerEnd - 1) break;
         const int n = jpsec_parse_sec_zones(bytes, size, m, starts, sizes,
-                                            JPSEC_MAX_ZONES);
+                                            JPSEC_MAX_ZONES, iv, macs);
         if (n > 0) {
             // Zones must be ordered and start inside the payload. Zones beyond
             // the bytes we hold are tolerated: a stream previously truncated to
@@ -123,12 +128,63 @@ JpscSecurity computeSecurityZones(const uint8_t* bytes, size_t size) {
                 sec.payloadStart = sod + 2;
                 sec.starts.assign(starts, starts + n);
                 sec.sizes.assign(sizes, sizes + n);
+                memcpy(sec.iv, iv, JPSEC_AES_IV_BYTES);
+                sec.macs.assign(macs, macs + (size_t)n * JPSEC_MAC_ENTRY_BYTES);
             }
             break;
         }
         i = m + 2;  // step past a look-alike FF 65 pair
     }
     return sec;
+}
+
+// Recompute the cumulative MAC chain over the now-decrypted zones 0..accessLevel
+// and compare it with the tags stored in the marker.
+//
+// Returns an empty string when the chain verifies, otherwise a message naming
+// the first level that failed. Levels above the grant are not touched: their
+// bytes are still ciphertext and their tags are meaningless without the key.
+//
+// The tags cover Z and T as well as the zone plaintext, so this catches a
+// relocated or resized zone as well as flipped payload bytes -- which is the
+// point: AES-256-CTR on its own detects neither.
+std::string verifyAccessibleMacs(uint8_t* bytes, size_t size,
+                                 const uint8_t key[JPSEC_AES_KEY_BYTES],
+                                 int accessLevel,
+                                 const JpscSecurity& sec) {
+    if (!sec.valid || sec.macs.size() != sec.sizes.size() * JPSEC_MAC_ENTRY_BYTES) {
+        return "";
+    }
+    if (size <= sec.payloadStart) return "";
+    const size_t payload = size - sec.payloadStart;
+    const int count = static_cast<int>(sec.sizes.size());
+    if (accessLevel < 0 || accessLevel >= count) accessLevel = count - 1;
+
+    uint8_t chain[JPSEC_MAX_ZONES * JPSEC_AES_KEY_BYTES];
+    if (jpsec_derive_level_keys(key, accessLevel + 1, chain) != accessLevel + 1) {
+        return "failed to derive granular key chain for MAC verification";
+    }
+    uint8_t computed[JPSEC_MAC_ENTRY_BYTES];
+    const uint8_t *prev = nullptr;
+    for (int r = 0; r <= accessLevel; ++r) {
+        const size_t start = sec.starts[(size_t)r];
+        const size_t len = (start >= payload)
+            ? 0
+            : std::min(static_cast<size_t>(sec.sizes[(size_t)r]), payload - start);
+        if (!jpsec_level_mac(prev, chain + (size_t)r * JPSEC_AES_KEY_BYTES,
+                             (uint32_t)r, sec.starts[(size_t)r],
+                             sec.sizes[(size_t)r],
+                             bytes + sec.payloadStart + start, len, computed)) {
+            return "failed to recompute level MAC";
+        }
+        if (!jpsec_macs_equal(computed,
+                              &sec.macs[(size_t)r * JPSEC_MAC_ENTRY_BYTES])) {
+            return "MAC verification failed at resolution level " +
+                   std::to_string(r) + ": the codestream has been modified";
+        }
+        prev = computed;
+    }
+    return "";
 }
 
 // Decrypt levels 0..accessLevel and return the number of payload bytes those
@@ -256,6 +312,14 @@ DecodeResult decodeInternal(const uint8_t* input, size_t inputSize,
 
     const JpscSecurity sec = computeSecurityZones(input, inputSize);
 
+    // The counter block travels in the marker, so it is authoritative for this
+    // codestream.  A caller-supplied IV is only used for a stream with no SEC
+    // marker, which by definition has no encryption to undo.
+    const uint8_t* useIv = iv;
+    if (sec.valid) {
+        useIv = sec.iv;
+    }
+
     // Levels the caller may read are decrypted in place; anything finer is
     // left as ciphertext. When the caller holds a subset, the codestream is
     // rebuilt around just those levels so OpenJPEG never meets a packet it
@@ -265,10 +329,18 @@ DecodeResult decodeInternal(const uint8_t* input, size_t inputSize,
     size_t bufferSize = inputSize;
     if (sec.valid) {
         const size_t keep = decryptAccessibleLevels(
-            const_cast<uint8_t*>(input), inputSize, key, iv, accessLevel, sec);
+            const_cast<uint8_t*>(input), inputSize, key, useIv, accessLevel, sec);
         const int total = static_cast<int>(sec.sizes.size());
         const int granted =
             (accessLevel < 0 || accessLevel >= total) ? total - 1 : accessLevel;
+        // Integrity is checked on the plaintext the caller may read, before any
+        // truncation, so a tampered zone is rejected rather than silently
+        // decoded into a plausible-looking image.
+        const std::string macError = verifyAccessibleMacs(
+            const_cast<uint8_t*>(input), inputSize, key, granted, sec);
+        if (!macError.empty()) {
+            throw std::runtime_error(macError);
+        }
         // Levels are counted coarse-first, so the finest image this key set can
         // reconstruct is the one at resolution level `granted`:
         //     reduction >= total - 1 - granted
@@ -467,6 +539,8 @@ struct SecurityZone {
     int zoneCount = 0;
     val starts = val::null();
     val sizes = val::null();
+    val macs = val::null();   // flat zoneCount * 32 bytes, cumulative per level
+    val iv = val::null();     // 16-byte counter block carried in the marker
 };
 
 SecurityZone describeSecurityZone(uintptr_t j2kBufferPtr, size_t bufferSize) {
@@ -484,6 +558,16 @@ SecurityZone describeSecurityZone(uintptr_t j2kBufferPtr, size_t bufferSize) {
         out.starts.call<void>("push", sec.starts[i]);
         out.sizes.call<void>("push", sec.sizes[i]);
     }
+    if (!sec.macs.empty()) {
+        out.macs = val::array();
+        for (size_t i = 0; i < sec.macs.size(); ++i) {
+            out.macs.call<void>("push", sec.macs[i]);
+        }
+    }
+    out.iv = val::array();
+    for (int i = 0; i < JPSEC_AES_IV_BYTES; ++i) {
+        out.iv.call<void>("push", static_cast<int>(sec.iv[i]));
+    }
     return out;
 }
 
@@ -500,7 +584,9 @@ EMSCRIPTEN_BINDINGS(j2k_decoder) {
         .field("hasSec", &SecurityZone::hasSec)
         .field("zoneCount", &SecurityZone::zoneCount)
         .field("starts", &SecurityZone::starts)
-        .field("sizes", &SecurityZone::sizes);
+        .field("sizes", &SecurityZone::sizes)
+        .field("macs", &SecurityZone::macs)
+        .field("iv", &SecurityZone::iv);
 
     function("decodeRaw", &decodeRaw);
     function("describeSecurityZone", &describeSecurityZone);
