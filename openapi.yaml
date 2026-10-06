@@ -235,9 +235,10 @@ paths:
                       type: integer
                       description: |
                         Number of DWT resolution levels in the codestream, i.e. the number of
-                        progressively addressable spatial levels. Level 0 is full resolution
-                        and each further level halves width and height. This project does not
-                        use JPEG 2000 quality layers, so this is the only progression axis.
+                        progressively addressable spatial levels. Level 0 is the coarsest
+                        approximation (as few as one pixel) and each further level doubles the
+                        linear resolution, so level `layers - 1` is full resolution. This project
+                        does not use JPEG 2000 quality layers, so this is the only progression axis.
                     width:
                       type: integer
                     height:
