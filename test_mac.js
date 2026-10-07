@@ -48,12 +48,22 @@ const log = m => console.log('        ' + m);
         decoder._free(p);
         return r;
     };
+    const keys = encoder.deriveGranularKeys(KEY, RES).map(k => new Uint8Array(Buffer.from(k, 'hex')));
     const decode = (buf, accessLevel) => {
         const p = decoder._malloc(buf.length);
         decoder.HEAPU8.set(buf, p);
+        const stack = decoder.stackSave();
         try {
-            const d = decoder.decodeRaw(p, buf.length, KEY, IV, accessLevel, 0);
+            const d = decoder.decodeRaw(p, buf.length, keys[accessLevel < 0 ? RES - 1 : accessLevel], IV, accessLevel, 0);
             return { w: d.width, h: d.height, r: d.reduction };
+        } catch (err) {
+            decoder.stackRestore(stack);
+            if (err && err.excPtr) {
+                const detail = decoder.getExceptionMessage(err);
+                decoder.decrementExceptionRefcount(err);
+                throw new Error(detail[1] || detail[0]);
+            }
+            throw err;
         } finally { decoder._free(p); }
     };
 

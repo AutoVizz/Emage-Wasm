@@ -83,6 +83,8 @@ async function run() {
     check(full.width === W && full.height === H, `full decode ${full.width}x${full.height}`);
     check(sum(full.rgbaPixels) === sum(ref.rgbaPixels), 'full decode matches plaintext reference');
 
+    const keys = encoder.deriveGranularKeys(KEY, RES).map(k => new Uint8Array(Buffer.from(k, 'hex')));
+
     // --- partial access ---
     // Access level a is coarse-first, so keys K0..Ka reconstruct the image at
     // resolution level a, which is reduction RES-1-a. Asking for anything
@@ -91,7 +93,7 @@ async function run() {
         const minReduction = RES - 1 - grant;
         for (const ask of [0, 1, 3, 5]) {
             const eff = Math.max(ask, minReduction);
-            const got = decoder.decodeRaw(toHeap(decoder, bytes), bytes.length, KEY, IV, grant, ask);
+            const got = decoder.decodeRaw(toHeap(decoder, bytes), bytes.length, keys[grant], IV, grant, ask);
             const exp = decoder.decodeRaw(toHeap(decoder, plain), plain.length, undefined, undefined, -1, eff);
             const expectW = Math.ceil(W / Math.pow(2, eff));
             const expectH = Math.ceil(H / Math.pow(2, eff));

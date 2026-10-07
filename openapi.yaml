@@ -3,16 +3,21 @@ info:
   title: Emage — JPEG 2000 layer-window server
   description: |
     Marker-only JPEG 2000 codestream server. Parses codestreams without decoding
-    (works on encrypted streams) and serves quality-layer windows for progressive
-    decoding, plus full-image upload with password auth.
+    and serves DWT resolution windows for progressive loading, plus full-image
+    upload with password authentication. "Layers" always means spatial resolution
+    levels, counted coarse-first, rather than JPEG 2000 quality layers.
 
-    Crypto-agnostic contract: the API never conveys whether an image is encrypted.
-    No header, query, or body field carries keys, IVs, or an encryption flag; the
-    server must not be extended to require or accept one. Encryption is entirely
-    in-band and self-describing on the client side: the codestream itself carries
-    its JPSEC SEC marker (0xFF 65), and only the client encrypts at encode time
-    and decrypts during decoding. The server treats that marker like any other
-    marker (the payload after SOD is opaque) and must never need to interpret it.
+    Crypto-agnostic contract: the server never needs to determine whether an image
+    is plaintext or encrypted, and never receives secret keys. It copies generic
+    header markers and opaque packet ranges without interpreting encryption.
+
+    Optional caller metadata travels inside a binary COM marker (FF 64) in the
+    image's main header, with Rcom=0 and the prefix "EMAGE-META" followed by a NUL
+    byte and a UTF-8 JSON object. The metadata response returns that object as
+    "metadata", or null when absent or malformed. The server does not interpret
+    its fields. No separate metadata file or upload metadata header is used.
+    Header-including windows preserve the COM marker verbatim. Clients can use
+    opaque lookup fields to select resolution bounds before fetching packets.
 
     Layer-window protocol:
       - `X-Emage-Layers: n:m`   → packets for layers n..m; header/framing included only when n == 0
@@ -272,6 +277,10 @@ components:
       type: object
       required: [layers, width, height, bytes]
       properties:
+        metadata:
+          type: [object, "null"]
+          additionalProperties: true
+          description: Opaque caller metadata from an EMAGE-META binary COM marker in the image main header, or null when absent. No encryption state is inferred by the server.
         layers:
           type: integer
           description: >-
@@ -290,6 +299,10 @@ components:
       type: object
       required: [stored, layers, width, height, bytes]
       properties:
+        metadata:
+          type: [object, "null"]
+          additionalProperties: true
+          description: Opaque caller metadata from an EMAGE-META binary COM marker in the image main header, or null when absent. No encryption state is inferred by the server.
         stored:
           type: string
           description: Path the codestream was stored at, relative to the image root.

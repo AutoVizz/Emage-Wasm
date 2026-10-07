@@ -48,7 +48,17 @@ void jpsec_aes256_ctr_crypt(const uint8_t key[JPSEC_AES_KEY_BYTES],
     mbedtls_aes_free(&ctx);
 }
 
-int jpsec_derive_level_keys(const uint8_t key0[JPSEC_AES_KEY_BYTES],
+int jpsec_key_lookup_tag(const uint8_t key[JPSEC_AES_KEY_BYTES],
+                         const uint8_t iv[JPSEC_AES_IV_BYTES],
+                         uint8_t out[JPSEC_MAC_ENTRY_BYTES]) {
+    uint8_t input[JPSEC_AES_IV_BYTES + JPSEC_AES_KEY_BYTES];
+    memcpy(input, iv, JPSEC_AES_IV_BYTES);
+    memcpy(input + JPSEC_AES_IV_BYTES, key, JPSEC_AES_KEY_BYTES);
+    return mbedtls_sha3(MBEDTLS_SHA3_256, input, sizeof(input), out,
+                        JPSEC_MAC_ENTRY_BYTES) == 0;
+}
+
+int jpsec_derive_level_keys(const uint8_t key_top[JPSEC_AES_KEY_BYTES],
                             int levels,
                             uint8_t *out) {
     size_t i;
@@ -56,13 +66,16 @@ int jpsec_derive_level_keys(const uint8_t key0[JPSEC_AES_KEY_BYTES],
     if (levels <= 0 || levels > JPSEC_MAX_ZONES) {
         return 0;
     }
-    memcpy(out, key0, JPSEC_AES_KEY_BYTES);
-    for (i = 1; i < (size_t)levels; ++i) {
-        (void)mbedtls_sha3(MBEDTLS_SHA3_256,
-                           out + (i - 1) * JPSEC_AES_KEY_BYTES,
-                           JPSEC_AES_KEY_BYTES,
-                           out + i * JPSEC_AES_KEY_BYTES,
-                           JPSEC_AES_KEY_BYTES);
+    memcpy(out + (size_t)(levels - 1) * JPSEC_AES_KEY_BYTES,
+           key_top, JPSEC_AES_KEY_BYTES);
+    for (i = (size_t)levels - 1; i > 0; --i) {
+        if (mbedtls_sha3(MBEDTLS_SHA3_256,
+                         out + i * JPSEC_AES_KEY_BYTES,
+                         JPSEC_AES_KEY_BYTES,
+                         out + (i - 1) * JPSEC_AES_KEY_BYTES,
+                         JPSEC_AES_KEY_BYTES) != 0) {
+            return 0;
+        }
     }
     return levels;
 }

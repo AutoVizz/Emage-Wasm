@@ -131,16 +131,17 @@ async function run() {
     // Keys K0..Ka reconstruct the image at resolution level a, i.e. reduction
     // numResolutions-1-a. A finer request must clamp rather than fabricate.
     const total = z1.zoneCount;
+    const keys = encoder.deriveGranularKeys(KEY, total).map(k => new Uint8Array(Buffer.from(k, 'hex')));
     let clampOk = true, boundedOk = true;
     for (let grant = 0; grant < total; ++grant) {
         const minReduction = total - 1 - grant;
         for (const ask of [0, minReduction]) {
             const eff = Math.max(ask, minReduction);
             const expectW = Math.ceil(W / Math.pow(2, eff));
-            const got = decoder.decodeRaw(toHeap(decoder, one), one.length, KEY, IV, grant, ask);
+            const got = decoder.decodeRaw(toHeap(decoder, one), one.length, keys[grant], IV, grant, ask);
             if (got.reduction !== eff || got.width !== expectW) boundedOk = false;
             // Repeat decode must be stable for the same stream and grant.
-            const again = decoder.decodeRaw(toHeap(decoder, one), one.length, KEY, IV, grant, ask);
+            const again = decoder.decodeRaw(toHeap(decoder, one), one.length, keys[grant], IV, grant, ask);
             if (checksum(got.rgbaPixels) !== checksum(again.rgbaPixels)) clampOk = false;
         }
     }
@@ -150,7 +151,7 @@ async function run() {
     // Fewer levels must not reproduce the full-resolution image.
     const full = decoder.decodeRaw(toHeap(decoder, one), one.length, KEY, IV, -1, 0);
     check(full.width === W && full.reduction === 0, 'access "all" decodes full resolution');
-    const coarse = decoder.decodeRaw(toHeap(decoder, one), one.length, KEY, IV, 0, 0);
+    const coarse = decoder.decodeRaw(toHeap(decoder, one), one.length, keys[0], IV, 0, 0);
     check(coarse.width < full.width && checksum(coarse.rgbaPixels) !== checksum(full.rgbaPixels),
         `coarsest grant yields a smaller, different image (${coarse.width}x${coarse.height})`);
 

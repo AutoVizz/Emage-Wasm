@@ -18,13 +18,14 @@ extern "C" {
  * decomposed image) and level E-1 the finest.  Each zone is encrypted exactly
  * once, with its own key drawn from a hash chain over the caller's master key:
  *
- *     K0 = master key
- *     K1 = SHA3-256(K0), K2 = SHA3-256(K1), ...
+ *     K(E-1) = master key
+ *     K(m-1) = SHA3-256(Km)
+ *
+ * A recipient gets Ka and derives K(a-1)..K0, never finer keys.
  *
  * Because OpenJPEG reconstructs a reduced image from the coarse levels only,
- * supplying K0..Kr is enough to decode at reduction r: every level above r
- * stays encrypted and is never touched.  Key count is therefore the access
- * grant, mirroring `reduction` on the decode side.
+ * supplying Ka is enough to decode at reduction E-1-a. Every level above a
+ * stays encrypted: deriving a finer key would require inverting SHA3-256.
  *
  * Marker layout (registry-based form, ISO/IEC 15444-8 / ITU-T T.807 5.5).
  * Offsets are relative to the start of the marker:
@@ -150,13 +151,21 @@ void jpsec_aes256_ctr_crypt(const uint8_t key[JPSEC_AES_KEY_BYTES],
                             size_t   len);
 
 /*
- * Derive the granular key chain from `key0`: out[0] = key0 and
- * out[i] = SHA3-256(out[i-1]).  `out` must hold count * 32 bytes.
+ * Derive coarse-first keys from the highest granted key `key_top`:
+ * out[count-1] = key_top and out[i-1] = SHA3-256(out[i]).
+ * The encoder supplies the master at count=E; the decoder supplies Ka at
+ * count=a+1. `out` must hold count * 32 bytes.
  * Returns the number of keys written, or 0 if count is out of range.
  */
-int jpsec_derive_level_keys(const uint8_t key0[JPSEC_AES_KEY_BYTES],
+int jpsec_derive_level_keys(const uint8_t key_top[JPSEC_AES_KEY_BYTES],
                             int count,
                             uint8_t *out);
+
+/* Public, per-file lookup tag: SHA3-256(iv || key). No key material is
+ * disclosed; callers can map these opaque tags to resolution indices. */
+int jpsec_key_lookup_tag(const uint8_t key[JPSEC_AES_KEY_BYTES],
+                         const uint8_t iv[JPSEC_AES_IV_BYTES],
+                         uint8_t out[JPSEC_MAC_ENTRY_BYTES]);
 
 /* Scan `buf[0..size)` for an FF <lo> marker starting at `from`. */
 size_t jpsec_find_marker(const uint8_t *buf, size_t size,

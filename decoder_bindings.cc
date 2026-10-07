@@ -53,7 +53,7 @@ OPJ_BOOL opj_mem_seek(OPJ_OFF_T p_nb_bytes, void* p_user_data) {
 // OpenJPEG consumes when reducing.
 //
 // `accessLevel` is the highest level the caller may read. The decoder derives
-// K0..K_accessLevel from the master key, decrypts exactly those zones, and
+// the supplied key's level from its MAC, derives coarser keys, and
 // leaves the rest as ciphertext. When the caller holds fewer levels than the
 // file contains, the codestream is rebuilt to declare and carry only the
 // levels it can read, so OpenJPEG is never handed a packet it cannot parse.
@@ -136,6 +136,46 @@ JpscSecurity computeSecurityZones(const uint8_t* bytes, size_t size) {
         i = m + 2;  // step past a look-alike FF 65 pair
     }
     return sec;
+}
+
+// Identify Ka by hashing toward K0 and authenticating the coarsest zone.
+// Only scratch bytes are decrypted during discovery. Once the key matches,
+// every requested zone must still pass the normal cumulative MAC check.
+int detectKeyLevel(const uint8_t* bytes, size_t size,
+                   const uint8_t key[JPSEC_AES_KEY_BYTES],
+                   const JpscSecurity& sec) {
+    const int count = static_cast<int>(sec.sizes.size());
+    if (count < 1 || sec.macs.size() != sec.sizes.size() * JPSEC_MAC_ENTRY_BYTES ||
+        sec.payloadStart > size || sec.starts[0] > size - sec.payloadStart ||
+        sec.sizes[0] > size - sec.payloadStart - sec.starts[0]) {
+        throw std::runtime_error("Cannot detect key level: coarsest zone or MAC is missing");
+    }
+    const uint8_t* ciphertext = bytes + sec.payloadStart + sec.starts[0];
+    std::vector<uint8_t> plain(sec.sizes[0]);
+    uint8_t candidate[JPSEC_AES_KEY_BYTES];
+    std::memcpy(candidate, key, sizeof(candidate));
+    for (int level = 0; level < count; ++level) {
+        if (!plain.empty()) {
+            std::memcpy(plain.data(), ciphertext, plain.size());
+            jpsec_aes256_ctr_crypt(candidate, sec.iv, plain.data(), plain.size());
+        }
+        uint8_t mac[JPSEC_MAC_ENTRY_BYTES];
+        if (!jpsec_level_mac(nullptr, candidate, 0, sec.starts[0], sec.sizes[0],
+                             plain.data(), plain.size(), mac)) {
+            throw std::runtime_error("Failed to authenticate key level");
+        }
+        if (jpsec_macs_equal(mac, sec.macs.data())) return level;
+        if (level + 1 < count) {
+            uint8_t pair[2 * JPSEC_AES_KEY_BYTES];
+            if (jpsec_derive_level_keys(candidate, 2, pair) != 2) {
+                throw std::runtime_error("Failed to derive key level");
+            }
+            std::memcpy(candidate, pair, sizeof(candidate));
+        }
+    }
+    throw std::runtime_error(
+        "MAC verification failed: key does not match this codestream, "
+        "or its coarsest zone has been modified (old files need re-encoding)");
 }
 
 // Recompute the cumulative MAC chain over the now-decrypted zones 0..accessLevel
@@ -284,6 +324,7 @@ struct DecodeResult {
     // re-deriving the decomposition count from the pixel dimensions.
     int reduction = 0;
     int numResolutions = 0;
+    int keyLevel = -1;  // authenticated level of the supplied key; -1 for plaintext
     val rgbaPixels = val::null();
 };
 
@@ -327,17 +368,23 @@ DecodeResult decodeInternal(const uint8_t* input, size_t inputSize,
     std::vector<uint8_t> owned;
     const uint8_t* j2kBytes = input;
     size_t bufferSize = inputSize;
+    int keyLevel = -1;
     if (sec.valid) {
-        const size_t keep = decryptAccessibleLevels(
-            const_cast<uint8_t*>(input), inputSize, key, useIv, accessLevel, sec);
         const int total = static_cast<int>(sec.sizes.size());
-        const int granted =
-            (accessLevel < 0 || accessLevel >= total) ? total - 1 : accessLevel;
+        keyLevel = detectKeyLevel(input, inputSize, key, sec);
+        const int granted = accessLevel < 0 ? keyLevel : std::min(accessLevel, keyLevel);
+        uint8_t chain[JPSEC_MAX_ZONES * JPSEC_AES_KEY_BYTES];
+        if (jpsec_derive_level_keys(key, keyLevel + 1, chain) != keyLevel + 1) {
+            throw std::runtime_error("Failed to derive detected key chain");
+        }
+        const uint8_t* grantedKey = chain + (size_t)granted * JPSEC_AES_KEY_BYTES;
+        const size_t keep = decryptAccessibleLevels(
+            const_cast<uint8_t*>(input), inputSize, grantedKey, useIv, granted, sec);
         // Integrity is checked on the plaintext the caller may read, before any
         // truncation, so a tampered zone is rejected rather than silently
         // decoded into a plausible-looking image.
         const std::string macError = verifyAccessibleMacs(
-            const_cast<uint8_t*>(input), inputSize, key, granted, sec);
+            const_cast<uint8_t*>(input), inputSize, grantedKey, granted, sec);
         if (!macError.empty()) {
             throw std::runtime_error(macError);
         }
@@ -465,7 +512,7 @@ DecodeResult decodeInternal(const uint8_t* input, size_t inputSize,
     val jsRgba = val::global("Uint8ClampedArray").new_(rgba.size());
     jsRgba.call<void>("set", val(typed_memory_view(rgba.size(), rgba.data())));
 
-    return DecodeResult{width, height, numComps, appliedReduction, numResolutions, jsRgba};
+    return DecodeResult{width, height, numComps, appliedReduction, numResolutions, keyLevel, jsRgba};
 }
 
 // Decrypt with a caller-supplied AES-256 master key and counter block. The
@@ -478,10 +525,9 @@ DecodeResult decodeInternal(const uint8_t* input, size_t inputSize,
 //
 // `accessLevel` is the highest DWT resolution level the caller may decrypt,
 // counted coarse-first: 0 is the 1-pixel approximation. K0..K_accessLevel are
-// derived from the master key, exactly the levels OpenJPEG needs to rebuild a
-// reduced image, and finer levels stay encrypted and are dropped from the
-// codestream handed to it. Pass a negative value to decrypt every level the
-// file contains.
+// derived backwards from the authenticated supplied key. The effective grant
+// is capped by its detected level. Pass a negative accessLevel to automatically
+// decode through the supplied key's level. Finer data stays encrypted.
 //
 // `reduction` is the number of DWT halvings to decode at: 0 is the full
 // resolution, 1 is half linear scale, and so on. It is clamped to the
@@ -531,6 +577,21 @@ DecodeResult decodeRaw(uintptr_t j2kBufferPtr,
                           reduction);
 }
 
+// Authenticate a key using only headers and level 0; no image decode or
+// finer packets are needed. This supports discovery on slow connections.
+int identifyKeyLevel(uintptr_t bufferPtr, size_t bufferSize, emscripten::val key) {
+    if (!bufferPtr || !bufferSize) throw std::runtime_error("Invalid input buffer");
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(bufferPtr);
+    const JpscSecurity sec = computeSecurityZones(bytes, bufferSize);
+    if (!sec.valid) return -1;
+    if (key.isNull() || key.isUndefined()) {
+        throw std::runtime_error("key is required: the codestream is encrypted");
+    }
+    const auto kb = convertJSArrayToNumberVector<uint8_t>(key);
+    if (kb.size() != JPSEC_AES_KEY_BYTES) throw std::runtime_error("key must be exactly 32 bytes");
+    return detectKeyLevel(bytes, bufferSize, kb.data(), sec);
+}
+
 // Report the per-level protection the decoder sees in a given buffer, without
 // modifying it. The progressive UI uses this to show which resolution levels
 // are already readable at each assembled stage and which are still ciphertext.
@@ -572,13 +633,35 @@ SecurityZone describeSecurityZone(uintptr_t j2kBufferPtr, size_t bufferSize) {
     return out;
 }
 
+// Produce an opaque key lookup tag; this is safe to attach to metadata.
+std::string keyLookupTag(emscripten::val key, emscripten::val iv) {
+    const auto kb = convertJSArrayToNumberVector<uint8_t>(key);
+    const auto ib = convertJSArrayToNumberVector<uint8_t>(iv);
+    if (kb.size() != JPSEC_AES_KEY_BYTES || ib.size() != JPSEC_AES_IV_BYTES) {
+        throw std::runtime_error("lookup requires a 32-byte key and 16-byte IV");
+    }
+    uint8_t tag[JPSEC_MAC_ENTRY_BYTES];
+    if (!jpsec_key_lookup_tag(kb.data(), ib.data(), tag)) {
+        throw std::runtime_error("Failed to compute key lookup tag");
+    }
+    static const char* hex = "0123456789abcdef";
+    std::string result;
+    for (uint8_t byte : tag) {
+        result.push_back(hex[byte >> 4]);
+        result.push_back(hex[byte & 15]);
+    }
+    return result;
+}
+
 EMSCRIPTEN_BINDINGS(j2k_decoder) {
+    function("keyLookupTag", &keyLookupTag);
     value_object<DecodeResult>("DecodeResult")
         .field("width", &DecodeResult::width)
         .field("height", &DecodeResult::height)
         .field("numComponents", &DecodeResult::numComponents)
         .field("reduction", &DecodeResult::reduction)
         .field("numResolutions", &DecodeResult::numResolutions)
+        .field("keyLevel", &DecodeResult::keyLevel)
         .field("rgbaPixels", &DecodeResult::rgbaPixels);
 
     value_object<SecurityZone>("SecurityZone")
@@ -590,5 +673,6 @@ EMSCRIPTEN_BINDINGS(j2k_decoder) {
         .field("iv", &SecurityZone::iv);
 
     function("decodeRaw", &decodeRaw);
+    function("identifyKeyLevel", &identifyKeyLevel);
     function("describeSecurityZone", &describeSecurityZone);
 }

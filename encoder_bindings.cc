@@ -25,11 +25,11 @@ constexpr int kCstyEph = 0x04;
 // The packet payload is split into one protected zone per DWT resolution
 // level, taken from the tile-part packet table (PLT), and each zone is
 // encrypted exactly once under its own key from the SHA3-256 chain over the
-// caller's master key: K0 = key, K1 = SHA3(K0), K2 = SHA3(K1), ...
+// caller's master key: K(E-1) = key, K(m-1) = SHA3-256(Km).
 //
 // Because OpenJPEG rebuilds a reduced image from the coarse levels only,
-// a holder of K0..Kr can decode at reduction r and never touches the levels
-// above it. The SEC marker records one zone entry per level so the decoder
+// a holder of Ka derives K0..Ka and decodes at reduction E-1-a without
+// learning any finer key. The SEC marker records one zone entry per level so the decoder
 // does not have to re-derive the boundaries; offsets are relative to the
 // first payload byte, which keeps them valid when the serving layer rebuilds
 // the main header. No key material is written to the file.
@@ -443,7 +443,28 @@ val deriveGranularKeys(emscripten::val key, int count) {
     return out;
 }
 
+// Produce an opaque key lookup tag; this is safe to attach to metadata.
+std::string keyLookupTag(emscripten::val key, emscripten::val iv) {
+    const auto kb = convertJSArrayToNumberVector<uint8_t>(key);
+    const auto ib = convertJSArrayToNumberVector<uint8_t>(iv);
+    if (kb.size() != JPSEC_AES_KEY_BYTES || ib.size() != JPSEC_AES_IV_BYTES) {
+        throw std::runtime_error("lookup requires a 32-byte key and 16-byte IV");
+    }
+    uint8_t tag[JPSEC_MAC_ENTRY_BYTES];
+    if (!jpsec_key_lookup_tag(kb.data(), ib.data(), tag)) {
+        throw std::runtime_error("Failed to compute key lookup tag");
+    }
+    static const char* hex = "0123456789abcdef";
+    std::string result;
+    for (uint8_t byte : tag) {
+        result.push_back(hex[byte >> 4]);
+        result.push_back(hex[byte & 15]);
+    }
+    return result;
+}
+
 EMSCRIPTEN_BINDINGS(j2k_jpsec_encoder) {
+    function("keyLookupTag", &keyLookupTag);
     value_object<EncodeOptions>("EncodeOptions")
         .field("width", &EncodeOptions::width)
         .field("height", &EncodeOptions::height)

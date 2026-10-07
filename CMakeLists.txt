@@ -42,7 +42,7 @@ set(EMSCRIPTEN_COMMON_FLAGS
         "-sENVIRONMENT=web"
         "-sNO_EXIT_RUNTIME=1"
         "-sEXPORTED_FUNCTIONS=_malloc,_free"
-        "-sEXPORTED_RUNTIME_METHODS=HEAPU8"
+        "-sEXPORTED_RUNTIME_METHODS=HEAPU8,stackSave,stackRestore,getExceptionMessage,decrementExceptionRefcount"
         # Surface C++ exceptions as catchable JS errors instead of abort()ing the
         # whole module when a decode/encode fails (e.g. a partial layer window
         # that OpenJPEG rejects). Costs a little size; keeps the page alive.
