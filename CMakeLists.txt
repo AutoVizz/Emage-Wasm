@@ -101,26 +101,25 @@ if (EMSCRIPTEN)
 endif ()
 
 # ==============================================================================
-# 3. PUBLISH TO CLIENT (../EmageClient/cmake-build-wasm)
+# 3. PUBLISH TO SERVER (../RiderProjects/Emage/Emage/wwwroot/wasm)
 # ==============================================================================
-# The web demos live in the sibling EmageClient directory and load the WASM
-# bundles relative to the page, so publish each built .js/.wasm pair there.
-set(EMAGE_CLIENT_WASM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../EmageClient/cmake-build-wasm")
+# Publish each built .js/.wasm pair to the server static assets.
+set(EMAGE_SERVER_WASM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../RiderProjects/Emage/Emage/wwwroot/wasm" CACHE PATH "Server WASM asset directory")
 
 if (EMSCRIPTEN)
     add_custom_command(TARGET EmageWasmEncoder POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${EMAGE_CLIENT_WASM_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${EMAGE_SERVER_WASM_DIR}"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_BINARY_DIR}/EmageWasmEncoder.js"
             "${CMAKE_BINARY_DIR}/EmageWasmEncoder.wasm"
-            "${EMAGE_CLIENT_WASM_DIR}/"
-            COMMENT "Publishing EmageWasmEncoder bundle to ${EMAGE_CLIENT_WASM_DIR}")
+            "${EMAGE_SERVER_WASM_DIR}/"
+            COMMENT "Publishing EmageWasmEncoder bundle to ${EMAGE_SERVER_WASM_DIR}")
 
     add_custom_command(TARGET EmageWasmDecoder POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${EMAGE_CLIENT_WASM_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${EMAGE_SERVER_WASM_DIR}"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_BINARY_DIR}/EmageWasmDecoder.js"
             "${CMAKE_BINARY_DIR}/EmageWasmDecoder.wasm"
-            "${EMAGE_CLIENT_WASM_DIR}/"
-            COMMENT "Publishing EmageWasmDecoder bundle to ${EMAGE_CLIENT_WASM_DIR}")
+            "${EMAGE_SERVER_WASM_DIR}/"
+            COMMENT "Publishing EmageWasmDecoder bundle to ${EMAGE_SERVER_WASM_DIR}")
 endif ()
